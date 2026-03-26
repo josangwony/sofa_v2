@@ -134,16 +134,14 @@ def erp_data_to_dataframe(data):
     return df
 
 def match_erp_to_items(data):
-    """ERP 구매의뢰 데이터를 ITEM_MASTER와 매칭하여 품목별 수량 산출"""
+    """ERP 구매의뢰 데이터를 ITEM_MASTER와 매칭 — 실제 개수(poqty) 그대로 반환"""
     qty_map = {code: 0 for code in ITEM_MASTER}
     for row in data:
         matcd = row.get('matcd', '')
         if matcd in MATCODE_TO_ITEM:
             item_code = MATCODE_TO_ITEM[matcd]
-            unit = ITEM_MASTER[item_code]['unit']
             poqty = int(row.get('poqty', 0))
-            cuts = math.ceil(poqty / unit) if unit > 0 else 0
-            qty_map[item_code] += cuts
+            qty_map[item_code] += poqty
     return qty_map
 
 # ============================================================
@@ -264,18 +262,41 @@ class Block:
             oa = sum(fr.area() for fr in frs)
         return cls(d['id'], frs, d.get('items',[]), True, d.get('saved_date',''), oa, obb)
 
+def _qty_to_pieces(order):
+    """품목별 수량(개수 기반) → 배치할 조각 리스트 반환
+    단위(unit) 미만 수량도 그대로 개수로 처리.
+    예) 오토만 unit=4, qty=10 → 10개 배치 (블록 깊이 방향 패킹은 SVG 외부)
+    """
+    pieces = []
+    for code, qty in order.items():
+        if qty <= 0:
+            continue
+        unit = ITEM_MASTER[code]['unit']
+        info = ITEM_MASTER[code]
+        # qty개를 unit개씩 묶어 블록을 채움
+        # 단, qty가 unit의 배수가 아닌 경우 마지막 조각을 부분 조각으로 처리
+        full_cuts = qty // unit         # 완전한 단위 묶음 수 (블록 2D에 올라가는 조각)
+        partial   = qty % unit          # 나머지 개수
+        for _ in range(full_cuts):
+            pieces.append((code, unit, False))   # (품목코드, 조각에 포함된 개수, 부분여부)
+        if partial > 0:
+            pieces.append((code, partial, True))
+    # 넓은 면적 우선 정렬
+    pieces.sort(key=lambda x: ITEM_MASTER[x[0]]['width']*ITEM_MASTER[x[0]]['depth'], reverse=True)
+    return pieces
+
 def pack_items(order, saved=None):
     blocks = [copy.deepcopy(s) for s in (saved or [])]
-    items = sorted([c for c,n in order.items() for _ in range(n) if n>0],
-                   key=lambda c: ITEM_MASTER[c]['width']*ITEM_MASTER[c]['depth'], reverse=True)
+    pieces = _qty_to_pieces(order)
     bc = max((b.id for b in blocks), default=0)
-    for code in items:
+    for code, cnt, is_partial in pieces:
         info = ITEM_MASTER[code]
         bb, bp = None, None
         for b in blocks:
             p = b.find_best_placement(info['width'], info['depth'])
             if p and (bp is None or p['score']<bp['score']): bb, bp = b, p
-        if bb and bp: bb.place_item(code, bp)
+        if bb and bp:
+            item = bb.place_item(code, bp)
         else:
             bc += 1; nb = Block(bc)
             p = nb.find_best_placement(info['width'], info['depth'])
@@ -783,40 +804,6 @@ for code in ITEM_MASTER:
     if f"qty_{code}" not in st.session_state:
         st.session_state[f"qty_{code}"] = 0
 
-# ── URL에서 pono 자동 감지 (ERP → 앱 링크) ──
-# 반드시 사이드바(number_input 위젯) 렌더링 전에 session_state를 세팅해야
-# StreamlitAPIException("widget key already exists") 오류를 방지할 수 있음
-try:
-    url_pono = st.query_params.get("pono", "")
-except AttributeError:
-    url_pono = st.experimental_get_query_params().get("pono", [""])[0]
-
-if url_pono and st.session_state.get('_auto_pono') != url_pono:
-    # 새 pono가 URL로 들어옴 → 자동 조회
-    st.session_state['_auto_pono'] = url_pono
-    with st.spinner(f"📡 구매의뢰 {url_pono} 자동 조회 중..."):
-        data, err = call_erp_query("PAN", url_pono)
-    if err:
-        st.error(err)
-    elif data:
-        st.session_state['_erp_data'] = data
-        st.session_state['_erp_pono'] = url_pono
-        st.session_state['_erp_storecd'] = "PAN"
-        # 위젯 렌더링 전이므로 session_state 직접 할당 가능
-        qty_map = match_erp_to_items(data)
-        for code, qty in qty_map.items():
-            st.session_state[f"qty_{code}"] = qty
-        # before_result: 즉시 수율 계산 후 전송
-        saved_blocks_for_auto = load_saved()
-        ld_auto = [copy.deepcopy(s) for s in saved_blocks_for_auto] if saved_blocks_for_auto else None
-        auto_blocks = pack_items(qty_map, ld_auto)
-        if auto_blocks:
-            avg_y_before = sum(b.yield_pct() for b in auto_blocks) / len(auto_blocks)
-            before_result = round(avg_y_before, 2)
-            call_erp_update_before_result("PAN", url_pono, before_result)
-            st.toast(f"✅ 구매의뢰 {url_pono} 자동 로드 | 사전수율 {before_result}% 전송 완료")
-        st.rerun()
-
 
 # ============================================================
 # 9. 사이드바
@@ -839,12 +826,29 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### 📋 품목별 생산 수량 입력")
+    st.caption("⚠️ 개수(ea) 직접 입력 — 단위 미만도 허용")
     input_slots = {}
     for code, info in ITEM_MASTER.items():
-        input_slots[code] = st.number_input(
-            f"[{code}] {info['matname']}  ({info['unit']}개/블록)",
-            min_value=0, step=1, key=f"qty_{code}",
-            help=f"📦 {info['matcd']}\n📐 {info['width']}×{info['depth']}×{info['height']}mm")
+        unit = info['unit']
+        val  = st.session_state.get(f"qty_{code}", 0)
+        # 단위 불일치 경고 표시
+        warn_html = ""
+        if val > 0 and val % unit != 0:
+            blocks_needed = math.ceil(val / unit)
+            waste = blocks_needed * unit - val
+            warn_html = (f"<small style='color:#E67E22;'>⚠️ {unit}개 단위 불일치 "
+                         f"(+{waste}개 여유공간)</small>")
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            input_slots[code] = st.number_input(
+                f"[{code}] {info['matname']}",
+                min_value=0, step=1, key=f"qty_{code}",
+                help=f"📦 {info['matcd']}\n📐 {info['width']}×{info['depth']}×{info['height']}mm\n단위: {unit}개/블록")
+        with col_b:
+            st.markdown(f"<div style='padding-top:28px;color:#7A736B;font-size:0.78rem;'>×{unit}/블록</div>",
+                        unsafe_allow_html=True)
+        if warn_html:
+            st.markdown(warn_html, unsafe_allow_html=True)
 
     st.divider()
     st.markdown("### 📦 저장된 잔여 블록")
@@ -1016,6 +1020,38 @@ if VIEW_MODE == "floor":
 # 관리자 화면
 # ══════════════════════════════════════
 
+# ── URL에서 pono 자동 감지 (ERP → 앱 링크) ──
+try:
+    url_pono = st.query_params.get("pono", "")
+except AttributeError:
+    url_pono = st.experimental_get_query_params().get("pono", [""])[0]
+
+if url_pono and st.session_state.get('_auto_pono') != url_pono:
+    # 새 pono가 URL로 들어옴 → 자동 조회
+    st.session_state['_auto_pono'] = url_pono
+    with st.spinner(f"📡 구매의뢰 {url_pono} 자동 조회 중..."):
+        data, err = call_erp_query("PAN", url_pono)
+    if err:
+        st.error(err)
+    elif data:
+        st.session_state['_erp_data'] = data
+        st.session_state['_erp_pono'] = url_pono
+        st.session_state['_erp_storecd'] = "PAN"
+        # 자동 수량 세팅
+        qty_map = match_erp_to_items(data)
+        for code, qty in qty_map.items():
+            st.session_state[f"qty_{code}"] = qty
+        # before_result: 즉시 수율 계산 후 전송
+        saved_blocks_for_auto = load_saved()
+        ld_auto = [copy.deepcopy(s) for s in saved_blocks_for_auto] if saved_blocks_for_auto else None
+        auto_blocks = pack_items(qty_map, ld_auto)
+        if auto_blocks:
+            avg_y_before = sum(b.yield_pct() for b in auto_blocks) / len(auto_blocks)
+            before_result = round(avg_y_before, 2)
+            call_erp_update_before_result("PAN", url_pono, before_result)
+            st.toast(f"✅ 구매의뢰 {url_pono} 자동 로드 | 사전수율 {before_result}% 전송 완료")
+        st.rerun()
+
 total_items = sum(input_slots.values())
 
 # ── ERP 구매의뢰 조회 (항상 표시) ──
@@ -1051,15 +1087,38 @@ with st.expander("📡 ERP 구매의뢰 조회 → 수량 자동 반영", expand
         df['품목매칭'] = df['자재코드'].map(
             lambda x: f"[{MATCODE_TO_ITEM[x]}] {ITEM_MASTER[MATCODE_TO_ITEM[x]]['matname']}"
             if x in MATCODE_TO_ITEM else "—")
+
+        # ── 단위 불일치 표시 포함 df 출력 ──
+        qty_map = match_erp_to_items(erp_data)
+        def _unit_status(row):
+            mc = row.get('자재코드', '') if isinstance(row, dict) else row['자재코드'] if '자재코드' in row.index else ''
+            qty = int(row.get('의뢰수량', 0) if isinstance(row, dict) else row['의뢰수량'])
+            if mc not in MATCODE_TO_ITEM:
+                return "—"
+            unit = ITEM_MASTER[MATCODE_TO_ITEM[mc]]['unit']
+            if qty % unit == 0:
+                return f"✅ {qty//unit}블록"
+            else:
+                blocks_n = math.ceil(qty / unit)
+                waste = blocks_n * unit - qty
+                return f"⚠️ {blocks_n}블록 (+{waste}개 여유)"
+        df['단위검토'] = df.apply(_unit_status, axis=1)
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-        qty_map = match_erp_to_items(erp_data)
         matched = {c: q for c, q in qty_map.items() if q > 0}
         if matched:
-            summary = " / ".join(f"[{c}] {ITEM_MASTER[c]['matname']}: {q}" for c, q in matched.items())
-            st.info(f"🔗 매칭 결과 (의뢰수량÷unit 올림): {summary}")
+            parts = []
+            for c, q in matched.items():
+                unit = ITEM_MASTER[c]['unit']
+                if q % unit == 0:
+                    parts.append(f"[{c}] {q}개 ({q//unit}블록 ✅)")
+                else:
+                    blocks_n = math.ceil(q / unit)
+                    waste = blocks_n * unit - q
+                    parts.append(f"[{c}] {q}개 ({blocks_n}블록, +{waste}개 여유 ⚠️)")
+            st.info("🔗 매칭 결과: " + " / ".join(parts))
 
-        bc1, bc2 = st.columns(2)
+        bc1, bc2, bc3 = st.columns(3)
         with bc1:
             if matched:
                 st.button("📥 사이드바 수량에 반영", key="erp_apply", use_container_width=True,
@@ -1074,6 +1133,74 @@ with st.expander("📡 ERP 구매의뢰 조회 → 수량 자동 반영", expand
                                file_name=f"ERP구매의뢰_{now_kst().strftime('%Y%m%d_%H%M')}.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                use_container_width=True)
+
+        # ══════════════════════════════════════════════════════
+        # ── 수량 수정 기능 (update-poqty) ──
+        # ══════════════════════════════════════════════════════
+        st.divider()
+        st.markdown("##### ✏️ 수량 수정 (ERP 전송)")
+        st.caption("조회된 자재의 의뢰수량을 수정하고 ERP에 반영합니다.")
+
+        # 수정 대상 선택 (자재코드+순번으로 구분)
+        erp_pono_cur  = st.session_state.get('_erp_pono', '')
+        erp_store_cur = st.session_state.get('_erp_storecd', 'PAN')
+
+        # 자재 선택 selectbox용 옵션 구성
+        row_options = {}
+        for row in erp_data:
+            matcd  = row.get('matcd', '')
+            matcol = row.get('matcol', 'XX')
+            po_seq = row.get('po_seq', 0)
+            matname = row.get('matname') or (ITEM_MASTER[MATCODE_TO_ITEM[matcd]]['matname'] if matcd in MATCODE_TO_ITEM else matcd)
+            label  = f"[순번{po_seq}] {matname} ({matcd})"
+            row_options[label] = row
+
+        if row_options:
+            sel_label = st.selectbox("수정할 자재 선택", list(row_options.keys()), key="upd_sel")
+            sel_row   = row_options[sel_label]
+            cur_qty   = int(sel_row.get('poqty', 0))
+            sel_unit  = ITEM_MASTER[MATCODE_TO_ITEM.get(sel_row.get('matcd',''), sel_row.get('matcd',''))]['unit'] \
+                        if sel_row.get('matcd','') in MATCODE_TO_ITEM else 1
+
+            upd_c1, upd_c2, upd_c3 = st.columns([1, 1, 1])
+            with upd_c1:
+                new_qty = st.number_input(
+                    f"수정 수량 (현재: {cur_qty}개, 단위: {sel_unit}개/블록)",
+                    min_value=0, value=cur_qty, step=1, key="upd_qty")
+            with upd_c2:
+                # after_result: 현재 시뮬레이션 평균 수율 자동 채움
+                _cur_blocks = st.session_state.get('_blocks', [])
+                _auto_yield = round(sum(b.yield_pct() for b in _cur_blocks)/len(_cur_blocks), 2) if _cur_blocks else 0.0
+                after_res = st.number_input(
+                    "사후검사 결과 (%)", min_value=0.0, max_value=100.0,
+                    value=_auto_yield, step=0.1, key="upd_after",
+                    help="현재 시뮬레이션 평균 수율이 자동으로 채워집니다.")
+            with upd_c3:
+                st.markdown("<br>", unsafe_allow_html=True)
+                upd_btn = st.button("📤 ERP 전송", key="upd_send", use_container_width=True)
+
+            # 단위 불일치 경고
+            if new_qty > 0 and new_qty % sel_unit != 0:
+                waste_upd = math.ceil(new_qty / sel_unit) * sel_unit - new_qty
+                st.warning(f"⚠️ 단위 불일치: {sel_unit}개 단위 기준 +{waste_upd}개 여유공간 발생")
+            elif new_qty > 0:
+                st.success(f"✅ 단위 일치: {new_qty // sel_unit}블록 정확히 생산")
+
+            if upd_btn:
+                _, err = call_erp_update_poqty(
+                    erp_store_cur, erp_pono_cur,
+                    sel_row.get('matcd',''), sel_row.get('matcol','XX'),
+                    sel_row.get('po_seq', 0), new_qty, after_res)
+                if err:
+                    st.error(f"전송 실패: {err}")
+                else:
+                    # 로컬 erp_data 캐시도 업데이트
+                    for r in st.session_state['_erp_data']:
+                        if r.get('po_seq') == sel_row.get('po_seq') and r.get('matcd') == sel_row.get('matcd'):
+                            r['poqty'] = new_qty
+                            break
+                    st.success(f"✅ ERP 전송 완료 — {sel_row.get('matcd','')} 수량 {cur_qty} → {new_qty}개 | 사후수율 {after_res}%")
+                    st.rerun()
 
 if total_items > 0:
     ld = [copy.deepcopy(s) for s in saved_blocks] if use_saved and saved_blocks else None
@@ -1099,8 +1226,29 @@ if total_items > 0:
 
     active = sum(1 for v in input_slots.values() if v > 0)
     avg_y = sum(b.yield_pct() for b in blocks)/len(blocks) if blocks else 0
-    total_u = sum(input_slots[c]*ITEM_MASTER[c]['unit'] for c in input_slots if input_slots[c]>0)
+    total_u = sum(input_slots[c] for c in input_slots if input_slots[c]>0)  # 실제 개수 합산
     recs = get_recommendations(blocks)
+
+    # ── 단위 불일치 분석 ──
+    mismatch_items = []
+    for c, qty in input_slots.items():
+        if qty <= 0:
+            continue
+        unit = ITEM_MASTER[c]['unit']
+        if qty % unit != 0:
+            blocks_n = math.ceil(qty / unit)
+            waste    = blocks_n * unit - qty
+            # "단위 맞춤" 수량으로 수율 비교
+            aligned_slots = dict(input_slots)
+            aligned_slots[c] = blocks_n * unit
+            aligned_blocks = pack_items(aligned_slots, ld)
+            aligned_y = sum(b.yield_pct() for b in aligned_blocks)/len(aligned_blocks) if aligned_blocks else 0
+            mismatch_items.append({
+                'code': c, 'matname': ITEM_MASTER[c]['matname'],
+                'qty': qty, 'unit': unit,
+                'blocks_n': blocks_n, 'waste': waste,
+                'aligned_qty': blocks_n * unit, 'aligned_y': aligned_y
+            })
 
     # ── 메트릭 ──
     ycolor = '#27AE60' if avg_y>=80 else '#F39C12' if avg_y>=60 else '#E74C3C'
@@ -1109,6 +1257,31 @@ if total_items > 0:
     c2.metric("생산 품목수", f"{active}종")
     c3.metric("평균 수율", f"{avg_y:.1f}%")
     c4.metric("총 생산수량", f"{total_u}개")
+
+    # ── 단위 불일치 경고 + 수율 비교 ──
+    if mismatch_items:
+        st.markdown("---")
+        st.markdown("##### ⚠️ 단위 불일치 품목 — 수율 비교")
+        mc_cols = st.columns(len(mismatch_items)) if len(mismatch_items) <= 4 else st.columns(4)
+        for idx, mi in enumerate(mismatch_items[:4]):
+            delta_y = mi['aligned_y'] - avg_y
+            with mc_cols[idx]:
+                st.markdown(f"""
+<div style="background:#FFF8E1;border:1px solid #FFCC80;border-radius:8px;padding:10px;font-size:0.82rem;">
+<b>[{mi['code']}] {mi['matname']}</b><br>
+현재: <b>{mi['qty']}개</b> → {mi['blocks_n']}블록<br>
+<span style="color:#E67E22;">여유공간: +{mi['waste']}개</span><br>
+단위맞춤: <b>{mi['aligned_qty']}개</b>로 수정 시<br>
+수율 <b>{avg_y:.1f}%</b> → <b style="color:{"#27AE60" if delta_y>=0 else "#E74C3C"}">{mi['aligned_y']:.1f}%</b>
+<span style="color:{"#27AE60" if delta_y>=0 else "#E74C3C"}">({delta_y:+.1f}%)</span>
+</div>""", unsafe_allow_html=True)
+                # 원클릭으로 단위 맞춤 수량 반영
+                def _align_qty(c=mi['code'], aq=mi['aligned_qty']):
+                    st.session_state[f"qty_{c}"] = aq
+                    st.session_state.pop('_blocks', None)
+                st.button(f"✅ {mi['aligned_qty']}개로 맞추기",
+                          key=f"align_{mi['code']}", use_container_width=True,
+                          on_click=_align_qty)
 
     # ── 추천 품목 (콤팩트 그리드) ──
     if recs:
