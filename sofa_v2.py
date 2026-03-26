@@ -699,7 +699,7 @@ header[data-testid="stHeader"]::after {
     color: #7A736B;
     letter-spacing: 0.5px;
 }
-.block-container { padding-top: 2.5rem !important; }
+.block-container { padding-top: 4rem !important; }
 /* 사이드바 상단 여백 강제 제거 */
 section[data-testid="stSidebar"] > div { padding-top: 0rem !important; margin-top: 0 !important; }
 section[data-testid="stSidebar"] .block-container { padding-top: 0 !important; }
@@ -772,7 +772,7 @@ with st.sidebar:
 if st.session_state.get('_view_log'):
     st.markdown("""<style>
     div[data-testid="stSidebar"] { display: none !important; }
-    .block-container { max-width: 950px !important; padding-top: 1.5rem !important; }
+    .block-container { max-width: 950px !important; padding-top: 3rem !important; }
     </style>""", unsafe_allow_html=True)
 
     st.markdown("### 📊 수율 배포 이력")
