@@ -60,7 +60,6 @@ for code, info in ITEM_MASTER.items():
 # ERP API 설정 (Streamlit Cloud: st.secrets / 로컬: .env)
 # ============================================================
 def _get_secret(key, default=""):
-    """st.secrets → os.getenv → default 순으로 탐색"""
     try:
         return st.secrets[key]
     except (KeyError, FileNotFoundError, AttributeError):
@@ -74,39 +73,51 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # Streamlit Cloud에서는 python-dotenv 없어도 됨
+    pass
 
-ERP_API_URL = _get_secret("ERP_API_URL", "https://dev-erp-api2.fursys.com/api/erp/v1/material-order/list")
-ERP_AUTH_KEY = _get_secret("ERP_AUTH_KEY")
-ERP_IDENTIFIER = _get_secret("ERP_IDENTIFIER", "erp_admin")
+ERP_BASE_URL = _get_secret("ERP_BASE_URL", "https://dev-erp-api2.fursys.com")
+ERP_AUTH_KEY = _get_secret("ERP_AUTH_KEY", "dc1c3d99-0700-4472-816e-e3f1e9111823")
+ERP_IDENTIFIER = _get_secret("ERP_IDENTIFIER", "external_partner")
 
-def call_erp_api(storecd="PAN", customcd="T01IAN", mat_list=None):
-    """ERP 자재발주 조회 API 호출"""
+def _erp_post(endpoint, data_body):
+    """ERP API 공통 호출"""
+    url = f"{ERP_BASE_URL}{endpoint}"
     payload = {
         "authentication_key": ERP_AUTH_KEY,
         "identifier_id": ERP_IDENTIFIER,
-        "data": {
-            "storecd": storecd,
-            "customcd": customcd,
-        }
+        "data": data_body
     }
-    if mat_list:
-        payload["data"]["mat_list"] = mat_list
-
     try:
-        resp = requests.post(ERP_API_URL, json=payload, timeout=10)
+        resp = requests.post(url, json=payload, timeout=10)
         resp.raise_for_status()
         result = resp.json()
         if result.get("_code") == 200:
             return result.get("data", []), None
         else:
-            return None, f"API 오류: {result.get('_message', '알 수 없는 오류')}"
+            return None, f"API 오류 ({result.get('_code')}): {result.get('_message', '알 수 없는 오류')}"
     except requests.exceptions.ConnectionError:
-        return None, "연결 실패: ERP 서버에 접근할 수 없습니다. (사내망 확인)"
+        return None, "연결 실패: ERP 서버에 접근할 수 없습니다."
     except requests.exceptions.Timeout:
         return None, "시간 초과: 10초 이내에 응답이 없습니다."
     except Exception as e:
         return None, f"오류: {str(e)}"
+
+def call_erp_query(storecd="PAN", pono=""):
+    """구매의뢰 상세 조회"""
+    return _erp_post("/api/erp/v1/mat-po-dtl/list", {"storecd": storecd, "pono": pono})
+
+def call_erp_update_poqty(storecd, pono, matcd, matcol, po_seq, poqty, after_result):
+    """구매의뢰수량 + 사후검사 결과 수정"""
+    return _erp_post("/api/erp/v1/mat-po-dtl/update-poqty", {
+        "storecd": storecd, "pono": pono, "matcd": matcd, "matcol": matcol,
+        "po_seq": po_seq, "poqty": poqty, "after_result": after_result
+    })
+
+def call_erp_update_before_result(storecd, pono, before_result):
+    """사전검사 결과 저장"""
+    return _erp_post("/api/erp/v1/mat-po-hed/update-before-result", {
+        "storecd": storecd, "pono": pono, "before_result": before_result
+    })
 
 def erp_data_to_dataframe(data):
     """ERP 응답 데이터를 DataFrame으로 변환"""
@@ -114,26 +125,24 @@ def erp_data_to_dataframe(data):
         return pd.DataFrame()
     df = pd.DataFrame(data)
     col_map = {
-        'storecd': '사업장', 'ordno': '발주번호', 'matcd': '자재코드',
-        'matcol': '컬러', 'ordqty': '발주수량', 'inqty': '입고수량',
-        'basedlvdt': '납기일', 'jobsts': '상태', 'pono': '구매오더'
+        'storecd': '사업장', 'pono': '구매의뢰번호', 'po_seq': '순번',
+        'matcd': '자재코드', 'matcol': '컬러', 'matname': '자재명',
+        'poqty': '의뢰수량', 'sizedtl': '사이즈', 'width': '가로',
+        'depth': '세로', 'height': '높이'
     }
     df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-    if '납기일' in df.columns:
-        df['납기일'] = pd.to_datetime(df['납기일']).dt.strftime('%Y-%m-%d')
     return df
 
 def match_erp_to_items(data):
-    """ERP 발주 데이터를 ITEM_MASTER와 매칭하여 품목별 발주수량 산출"""
+    """ERP 구매의뢰 데이터를 ITEM_MASTER와 매칭하여 품목별 수량 산출"""
     qty_map = {code: 0 for code in ITEM_MASTER}
     for row in data:
         matcd = row.get('matcd', '')
         if matcd in MATCODE_TO_ITEM:
             item_code = MATCODE_TO_ITEM[matcd]
             unit = ITEM_MASTER[item_code]['unit']
-            ordqty = int(row.get('ordqty', 0))
-            # 발주수량 ÷ unit = 필요 재단 횟수 (올림)
-            cuts = math.ceil(ordqty / unit) if unit > 0 else 0
+            poqty = int(row.get('poqty', 0))
+            cuts = math.ceil(poqty / unit) if unit > 0 else 0
             qty_map[item_code] += cuts
     return qty_map
 
@@ -975,39 +984,46 @@ if VIEW_MODE == "floor":
 
 total_items = sum(input_slots.values())
 
-# ── ERP 발주 조회 (항상 표시) ──
-with st.expander("📡 ERP 발주 조회 → 수량 자동 반영", expanded=False):
+# ── ERP 구매의뢰 조회 (항상 표시) ──
+with st.expander("📡 ERP 구매의뢰 조회 → 수량 자동 반영", expanded=False):
     erp_c1, erp_c2, erp_c3 = st.columns([1.5, 1.5, 1])
     with erp_c1:
         storecd = st.text_input("사업장코드", value="PAN", key="erp_store")
     with erp_c2:
-        customcd = st.text_input("거래처코드", value="T01IAN", key="erp_custom")
+        pono = st.text_input("구매의뢰번호", value="", key="erp_pono", placeholder="예: B20260200002")
     with erp_c3:
         st.markdown("<br>", unsafe_allow_html=True)
         erp_query = st.button("🔍 조회", key="erp_query", use_container_width=True)
 
     if erp_query:
-        with st.spinner("ERP 조회 중..."):
-            data, err = call_erp_api(storecd, customcd)
-        if err:
-            st.error(err)
-        elif data:
-            st.session_state['_erp_data'] = data
-            st.success(f"✅ {len(data)}건 조회됨")
+        if not pono:
+            st.warning("구매의뢰번호를 입력하세요.")
         else:
-            st.warning("조회 결과가 없습니다.")
+            with st.spinner("ERP 조회 중..."):
+                data, err = call_erp_query(storecd, pono)
+            if err:
+                st.error(err)
+            elif data:
+                st.session_state['_erp_data'] = data
+                st.session_state['_erp_pono'] = pono
+                st.session_state['_erp_storecd'] = storecd
+                st.success(f"✅ {len(data)}건 조회됨")
+            else:
+                st.warning("조회 결과가 없습니다.")
 
     erp_data = st.session_state.get('_erp_data')
     if erp_data:
         df = erp_data_to_dataframe(erp_data)
-        df['품목'] = df['자재코드'].map(lambda x: f"[{MATCODE_TO_ITEM[x]}] {ITEM_MASTER[MATCODE_TO_ITEM[x]]['matname']}" if x in MATCODE_TO_ITEM else "—")
+        df['품목매칭'] = df['자재코드'].map(
+            lambda x: f"[{MATCODE_TO_ITEM[x]}] {ITEM_MASTER[MATCODE_TO_ITEM[x]]['matname']}"
+            if x in MATCODE_TO_ITEM else "—")
         st.dataframe(df, use_container_width=True, hide_index=True)
 
         qty_map = match_erp_to_items(erp_data)
         matched = {c: q for c, q in qty_map.items() if q > 0}
         if matched:
             summary = " / ".join(f"[{c}] {ITEM_MASTER[c]['matname']}: {q}" for c, q in matched.items())
-            st.info(f"🔗 매칭 결과 (발주수량÷unit 올림): {summary}")
+            st.info(f"🔗 매칭 결과 (의뢰수량÷unit 올림): {summary}")
 
         bc1, bc2 = st.columns(2)
         with bc1:
@@ -1021,7 +1037,7 @@ with st.expander("📡 ERP 발주 조회 → 수량 자동 반영", expanded=Fal
             df.to_excel(buf, index=False, engine='openpyxl')
             buf.seek(0)
             st.download_button("📊 엑셀 다운로드", data=buf,
-                               file_name=f"ERP발주조회_{now_kst().strftime('%Y%m%d_%H%M')}.xlsx",
+                               file_name=f"ERP구매의뢰_{now_kst().strftime('%Y%m%d_%H%M')}.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                use_container_width=True)
 
