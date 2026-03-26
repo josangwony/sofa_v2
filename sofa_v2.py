@@ -591,7 +591,14 @@ def delete_deploy_rows_by_no(deploy_no):
 # ============================================================
 # 5. SVG 시각화
 # ============================================================
-DARK_TEXT_COLORS = {'#E74C3C','#3498DB','#2ECC71','#1ABC9C','#9B59B6','#1E8449','#8E44AD','#2980B9'}
+def _text_color(hex_col):
+    """배경색 밝기에 따라 흰색/검은색 텍스트 선택 (W3C 상대 휘도 기준)"""
+    h = hex_col.lstrip('#')
+    r, g, b = int(h[0:2],16)/255, int(h[2:4],16)/255, int(h[4:6],16)/255
+    # sRGB → 선형
+    def lin(c): return c/12.92 if c<=0.04045 else ((c+0.055)/1.055)**2.4
+    lum = 0.2126*lin(r) + 0.7152*lin(g) + 0.0722*lin(b)
+    return "#FFF" if lum < 0.35 else "#2C3E50"
 
 def make_svg(block, idx, saved_label=None):
     uid = f"b{idx}"
@@ -694,7 +701,7 @@ def make_svg(block, idx, saved_label=None):
         fs2 = max(8, int(fs * 0.78))
 
         ra = f'transform="rotate(-90,{cx},{cy_})"' if rot else ''
-        tc = "#FFF" if col in DARK_TEXT_COLORS else "#2C3E50"
+        tc = _text_color(col)
 
         # 변 치수 (가로 상단, 세로 우측)
         dfs = max(8, min(11, int(mn/10)))
