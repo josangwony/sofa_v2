@@ -922,22 +922,49 @@ if st.session_state.get('_view_log'):
     if sheet_rows:
         hist_df = pd.DataFrame(sheet_rows)
 
-        # 배포No 추가 (배포일시 기준 그룹)
-        unique_dates = []
-        for dt in hist_df['배포일시']:
-            if dt not in unique_dates:
-                unique_dates.append(dt)
-        hist_df['배포No'] = hist_df['배포일시'].map(lambda x: unique_dates.index(x)+1)
+        # ── 컬럼명 정규화 (시트 헤더가 다를 경우 대비) ──
+        col_alias = {
+            # 가능한 다른 이름 → 표준 이름
+            'deployed_at': '배포일시', 'deploy_at': '배포일시',
+            'block': '블록', 'block_label': '블록',
+            'yield': '블록수율(%)', 'block_yield': '블록수율(%)', '블록수율': '블록수율(%)',
+            'matcd': '자재코드', 'mat_cd': '자재코드',
+            'matname': '품목명', 'mat_name': '품목명',
+            'unit': '생산수량', 'qty': '생산수량',
+        }
+        hist_df.rename(columns={k: v for k, v in col_alias.items()
+                                 if k in hist_df.columns and v not in hist_df.columns},
+                       inplace=True)
 
-        display_cols = ['배포No','배포일시','블록','블록수율(%)','자재코드','품목명','생산수량']
-        display_cols = [c for c in display_cols if c in hist_df.columns]
+        # '배포일시' 컬럼이 없으면 시트 구조가 달라진 것 → 안내
+        if '배포일시' not in hist_df.columns:
+            st.warning(f"⚠️ 시트 컬럼 구조가 예상과 다릅니다. 현재 컬럼: {list(hist_df.columns)}")
+            st.dataframe(hist_df, use_container_width=True, hide_index=True, height=400)
+        else:
+            # 배포No 추가 (배포일시 기준 그룹)
+            unique_dates = []
+            for dt in hist_df['배포일시']:
+                if dt not in unique_dates:
+                    unique_dates.append(dt)
+            hist_df['배포No'] = hist_df['배포일시'].map(lambda x: unique_dates.index(x)+1)
 
-        st.dataframe(hist_df[display_cols], use_container_width=True, hide_index=True, height=500)
+            display_cols = ['배포No','배포일시','블록','블록수율(%)','자재코드','품목명','생산수량']
+            display_cols = [c for c in display_cols if c in hist_df.columns]
 
-        n_deploys = len(unique_dates)
-        avg_yields = hist_df.drop_duplicates(subset=['배포일시','블록']).groupby('배포일시')['블록수율(%)'].mean()
-        total_avg = avg_yields.mean() if len(avg_yields) > 0 else 0
-        st.caption(f"총 {n_deploys}건 배포 | 평균 수율 {total_avg:.1f}%")
+            st.dataframe(hist_df[display_cols], use_container_width=True, hide_index=True, height=500)
+
+            n_deploys = len(unique_dates)
+            # '블록수율(%)' 컬럼이 있을 때만 평균 계산
+            if '블록수율(%)' in hist_df.columns and '블록' in hist_df.columns:
+                try:
+                    avg_yields = (hist_df.drop_duplicates(subset=['배포일시','블록'])
+                                  .groupby('배포일시')['블록수율(%)'].mean())
+                    total_avg = avg_yields.mean() if len(avg_yields) > 0 else 0
+                except Exception:
+                    total_avg = 0
+            else:
+                total_avg = 0
+            st.caption(f"총 {n_deploys}건 배포 | 평균 수율 {total_avg:.1f}%")
 
         dc1, dc2, dc3 = st.columns([2, 1, 1])
         with dc1:
@@ -1229,24 +1256,37 @@ if total_items > 0:
     recs = get_recommendations(blocks)
 
     # ── 단위 불일치 분석 ──
+    # 주의: aligned_slots도 개수 기반이므로 pack_items → _qty_to_pieces를 거치면
+    #       내부에서 qty÷unit을 다시 나눠 결국 같은 블록 수가 됨.
+    #       따라서 "단위 맞춤 시 수율"은 aligned_slots로 직접 pack_items를 호출하되,
+    #       _qty_to_pieces가 완전한 단위로만 처리하게 aligned_qty = blocks_n*unit 로 세팅.
+    #       이 값은 unit의 배수이므로 _qty_to_pieces 내 partial 조각이 0이 되어
+    #       현재(qty개) vs 맞춤(blocks_n*unit개) 간 실제 차이가 발생함.
     mismatch_items = []
     for c, qty in input_slots.items():
         if qty <= 0:
             continue
         unit = ITEM_MASTER[c]['unit']
         if qty % unit != 0:
-            blocks_n = math.ceil(qty / unit)
-            waste    = blocks_n * unit - qty
-            # "단위 맞춤" 수량으로 수율 비교
-            aligned_slots = dict(input_slots)
-            aligned_slots[c] = blocks_n * unit
-            aligned_blocks = pack_items(aligned_slots, ld)
-            aligned_y = sum(b.yield_pct() for b in aligned_blocks)/len(aligned_blocks) if aligned_blocks else 0
+            blocks_n  = math.ceil(qty / unit)
+            waste     = blocks_n * unit - qty
+            aligned_qty = blocks_n * unit  # unit의 정확한 배수
+
+            # 현재 수율: qty개 → 부분 조각 포함
+            # 단위 맞춤 수율: aligned_qty개 → 완전 조각만 (부분 조각 없음 → 빈공간 없음)
+            aligned_slots = {k: v for k, v in input_slots.items()}
+            aligned_slots[c] = aligned_qty
+            # ld를 새로 deep-copy해서 재사용 (ld는 위에서 이미 deep-copy됨)
+            ld2 = [copy.deepcopy(s) for s in saved_blocks] if use_saved and saved_blocks else None
+            aligned_blocks = pack_items(aligned_slots, ld2)
+            aligned_y = (sum(b.yield_pct() for b in aligned_blocks) / len(aligned_blocks)
+                         if aligned_blocks else 0)
+
             mismatch_items.append({
                 'code': c, 'matname': ITEM_MASTER[c]['matname'],
                 'qty': qty, 'unit': unit,
                 'blocks_n': blocks_n, 'waste': waste,
-                'aligned_qty': blocks_n * unit, 'aligned_y': aligned_y
+                'aligned_qty': aligned_qty, 'aligned_y': aligned_y,
             })
 
     # ── 메트릭 ──
