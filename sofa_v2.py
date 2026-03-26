@@ -1472,22 +1472,37 @@ if total_items > 0:
 
         success_count = 0
         errors = []
+        debug_rows = []  # 전송 데이터 디버그용
+
         for row in erp_data:
-            matcd  = row.get('matcd', '')
-            matcol = row.get('matcol', '')
-            po_seq = row.get('po_seq', 0)
-            # 사이드바 최종 수량 우선 사용, 매칭 안 되면 원본 발주 수량 fallback
+            matcd  = str(row.get('matcd', ''))
+            matcol = str(row.get('matcol', 'XX'))
+            po_seq = int(row.get('po_seq', 0))
+
+            # 사이드바 최종 수량 우선, fallback은 원본 발주 수량
             item_code = MATCODE_TO_ITEM.get(matcd)
             if item_code and item_code in input_slots:
-                poqty = input_slots[item_code]   # ← 사이드바 최종 조정값
+                poqty = int(input_slots[item_code])
             else:
-                poqty = row.get('poqty', 0)      # ← fallback: 원본 발주 수량
+                poqty = int(row.get('poqty', 0))
+
+            debug_rows.append({
+                'storecd': erp_storecd, 'pono': erp_pono,
+                'matcd': matcd, 'matcol': matcol,
+                'po_seq': po_seq, 'poqty': poqty,
+                'after_result': after_result
+            })
+
             _, err = call_erp_update_poqty(
                 erp_storecd, erp_pono, matcd, matcol, po_seq, poqty, after_result)
             if err:
                 errors.append(f"{matcd}: {err}")
             else:
                 success_count += 1
+
+        # 전송 데이터 항상 표시 (성공/실패 모두)
+        with st.expander("📋 전송 데이터 확인", expanded=bool(errors)):
+            st.dataframe(debug_rows, use_container_width=True)
 
         if errors:
             st.error(f"⚠️ {len(errors)}건 오류: {'; '.join(errors[:3])}")
