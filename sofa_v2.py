@@ -5,8 +5,13 @@ import streamlit as st
 import streamlit.components.v1 as components
 import json, os, copy, math, requests
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from io import BytesIO
+
+# 한국 시간 (UTC+9)
+KST = timezone(timedelta(hours=9))
+def now_kst():
+    return datetime.now(KST)
 
 
 # ============================================================
@@ -233,7 +238,7 @@ class Block:
         return {'id': self.id, 'items': self.items,
                 'free_rects': [f.to_dict() for f in self.free_rects],
                 'is_saved': self.is_saved, 'original_area': oa, 'original_bb': obb,
-                'saved_date': self.saved_date or datetime.now().strftime('%Y-%m-%d %H:%M')}
+                'saved_date': self.saved_date or now_kst().strftime('%Y-%m-%d %H:%M')}
 
     @classmethod
     def from_dict(cls, d):
@@ -372,7 +377,7 @@ def add_saved(block):
         except: pass
     nid = max((d['id'] for d in raw), default=0)+1
     d = block.to_dict(); d['id']=nid; d['is_saved']=True
-    d['saved_date'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+    d['saved_date'] = now_kst().strftime('%Y-%m-%d %H:%M')
     raw.append(d); _save_raw(raw)
 
 def remove_saved(bid):
@@ -389,7 +394,7 @@ def remove_saved(bid):
 # ── 현장 배포 + 이력 ──
 def save_plan(blocks, input_slots):
     """관리자가 확정한 재단 계획 저장 + 이력 기록"""
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    now = now_kst().strftime('%Y-%m-%d %H:%M:%S')
     avg_y = sum(b.yield_pct() for b in blocks) / len(blocks) if blocks else 0
     total_u = sum(input_slots.get(c,0) * ITEM_MASTER[c]['unit'] for c in ITEM_MASTER if input_slots.get(c,0)>0)
 
@@ -429,23 +434,16 @@ def save_plan(blocks, input_slots):
         'blocks': block_logs,
     }
 
-    # 이력 로드
-    history = _gs_read('deploy_history') or []
-    if not isinstance(history, list):
-        history = []
-    if not history:
-        try:
-            if os.path.exists(DEPLOY_LOG_FILE):
-                with open(DEPLOY_LOG_FILE,'r',encoding='utf-8') as f:
-                    history = json.load(f)
-        except: history = []
+    # 이력 저장 — Google Sheets에 행 추가
+    _gs_append_deploy_rows(block_logs, now, len(blocks), round(avg_y, 1), total_u)
 
-    history.append(log_entry)
-    history = history[-50:]
-
-    # 이력 저장
-    _gs_write('deploy_history', history)
+    # 로컬 백업
     try:
+        history = []
+        if os.path.exists(DEPLOY_LOG_FILE):
+            with open(DEPLOY_LOG_FILE,'r',encoding='utf-8') as f:
+                history = json.load(f)
+        history.append(log_entry)
         with open(DEPLOY_LOG_FILE, 'w', encoding='utf-8') as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
     except: pass
@@ -468,25 +466,85 @@ def load_plan():
         except: pass
     return None, []
 
-def load_deploy_history():
-    """배포 이력 로드"""
-    history = _gs_read('deploy_history')
-    if history and isinstance(history, list):
-        return history
+def _gs_append_deploy_rows(block_logs, deployed_at, n_blocks, avg_yield, total_units):
+    """deploy_history 시트에 행 단위로 추가 (블록×품목별 1행)"""
     try:
-        if os.path.exists(DEPLOY_LOG_FILE):
-            with open(DEPLOY_LOG_FILE,'r',encoding='utf-8') as f:
-                return json.load(f)
-    except: pass
-    return []
+        wb = _get_gsheet()
+        if not wb:
+            return False
+        ws = wb.worksheet('deploy_history')
+        # 헤더가 없으면 추가
+        first = ws.acell('A1').value
+        if not first:
+            ws.update('A1:I1', [['배포일시','블록수','평균수율(%)','총생산수량','블록','블록수율(%)','자재코드','품목명','생산수량']])
 
-def save_deploy_history(history):
-    """배포 이력 저장"""
-    _gs_write('deploy_history', history)
+        # 행 추가
+        rows = []
+        for bl in block_logs:
+            if bl.get('items'):
+                for item in bl['items']:
+                    rows.append([
+                        deployed_at, n_blocks, avg_yield, total_units,
+                        f"{bl['block_type']} #{bl['block_no']}", bl['yield'],
+                        item.get('matcd',''), item.get('matname',''), item.get('unit','')
+                    ])
+            else:
+                rows.append([
+                    deployed_at, n_blocks, avg_yield, total_units,
+                    f"{bl['block_type']} #{bl['block_no']}", bl['yield'],
+                    '', '', ''
+                ])
+        if rows:
+            ws.append_rows(rows, value_input_option='USER_ENTERED')
+        return True
+    except Exception:
+        return False
+
+def load_deploy_history_from_sheet():
+    """deploy_history 시트에서 행 단위로 읽기"""
     try:
-        with open(DEPLOY_LOG_FILE,'w',encoding='utf-8') as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
-    except: pass
+        wb = _get_gsheet()
+        if not wb:
+            return None
+        ws = wb.worksheet('deploy_history')
+        all_rows = ws.get_all_records()
+        if all_rows:
+            return all_rows
+    except Exception:
+        pass
+    return None
+
+def delete_deploy_rows_by_no(deploy_no):
+    """특정 배포No의 행들을 시트에서 삭제"""
+    try:
+        wb = _get_gsheet()
+        if not wb:
+            return False
+        ws = wb.worksheet('deploy_history')
+        all_vals = ws.get_all_values()
+        if len(all_vals) <= 1:
+            return False  # 헤더만 있음
+
+        # 배포일시 기준으로 그룹핑해서 No 매기기
+        header = all_vals[0]
+        data_rows = all_vals[1:]
+        # 배포일시 목록 (유니크, 순서 유지)
+        seen = []
+        for r in data_rows:
+            dt = r[0]
+            if dt not in seen:
+                seen.append(dt)
+        if deploy_no < 1 or deploy_no > len(seen):
+            return False
+        target_dt = seen[deploy_no - 1]
+
+        # 삭제할 행 인덱스 (1-based, 헤더=1)
+        del_indices = [i+2 for i, r in enumerate(data_rows) if r[0] == target_dt]
+        for idx in reversed(del_indices):
+            ws.delete_rows(idx)
+        return True
+    except Exception:
+        return False
 
 # ============================================================
 # 5. SVG 시각화
@@ -781,80 +839,48 @@ if st.session_state.get('_view_log'):
         st.session_state['_view_log'] = False
     st.button("← 시뮬레이션으로 돌아가기", key="back_from_log", on_click=_close_log)
 
-    history = load_deploy_history()
-    if history:
-            # 블록별 → 품목별로 행 전개
-            rows = []
-            for i, h in enumerate(history):
-                deploy_no = i + 1
-                dt = h['deployed_at']
+    # Google Sheets에서 행 단위로 읽기
+    sheet_rows = load_deploy_history_from_sheet()
+    if sheet_rows:
+        hist_df = pd.DataFrame(sheet_rows)
 
-                if 'blocks' in h:
-                    for bl in h['blocks']:
-                        if bl.get('items'):
-                            for item in bl['items']:
-                                rows.append({
-                                    '배포No': deploy_no, '배포일시': dt,
-                                    '블록': f"{bl['block_type']} #{bl['block_no']}",
-                                    '블록수율(%)': bl['yield'],
-                                    '자재코드': item.get('matcd',''),
-                                    '색상': item.get('matcol',''),
-                                    '품목명': item.get('matname',''),
-                                    '생산수량': item.get('unit', ''),
-                                })
-                        else:
-                            rows.append({
-                                '배포No': deploy_no, '배포일시': dt,
-                                '블록': f"{bl['block_type']} #{bl['block_no']}",
-                                '블록수율(%)': bl['yield'],
-                            })
-                elif h.get('items_detail'):
-                    for d in h['items_detail']:
-                        rows.append({
-                            '배포No': deploy_no, '배포일시': dt,
-                            '블록': '-', '블록수율(%)': h.get('avg_yield',''),
-                            '자재코드': d.get('matcd',''), '색상': d.get('matcol',''),
-                            '품목명': d.get('matname',''), '생산수량': d.get('qty',''),
-                        })
-                elif h.get('items'):
-                    for k, v in h['items'].items():
-                        if k in ITEM_MASTER:
-                            info = ITEM_MASTER[k]
-                            rows.append({
-                                '배포No': deploy_no, '배포일시': dt,
-                                '블록': '-', '블록수율(%)': h.get('avg_yield',''),
-                                '자재코드': info['matcd'], '색상': info['matcol'],
-                                '품목명': info['matname'], '생산수량': v,
-                            })
+        # 배포No 추가 (배포일시 기준 그룹)
+        unique_dates = []
+        for dt in hist_df['배포일시']:
+            if dt not in unique_dates:
+                unique_dates.append(dt)
+        hist_df['배포No'] = hist_df['배포일시'].map(lambda x: unique_dates.index(x)+1)
 
-            hist_df = pd.DataFrame(rows)
-            display_cols = ['배포No','배포일시','블록','블록수율(%)','자재코드','색상','품목명','생산수량']
-            display_cols = [c for c in display_cols if c in hist_df.columns]
+        display_cols = ['배포No','배포일시','블록','블록수율(%)','자재코드','품목명','생산수량']
+        display_cols = [c for c in display_cols if c in hist_df.columns]
 
-            st.dataframe(hist_df[display_cols], use_container_width=True, hide_index=True, height=500)
-            st.caption(f"총 {len(history)}건 배포 | 평균 수율 {sum(h['avg_yield'] for h in history)/len(history):.1f}%")
+        st.dataframe(hist_df[display_cols], use_container_width=True, hide_index=True, height=500)
 
-            dc1, dc2, dc3 = st.columns([2, 1, 1])
-            with dc1:
-                del_idx = st.number_input("삭제할 No 입력", min_value=1, max_value=len(history),
-                                          value=1, step=1, key="del_log_no")
-            with dc2:
-                st.markdown("<br>", unsafe_allow_html=True)
-                if st.button("🗑️ 선택 삭제", key="del_log_btn", use_container_width=True):
-                    actual_idx = del_idx - 1
-                    if 0 <= actual_idx < len(history):
-                        history.pop(actual_idx)
-                        save_deploy_history(history)
-                        st.rerun()
-            with dc3:
-                st.markdown("<br>", unsafe_allow_html=True)
-                buf = BytesIO()
-                hist_df[display_cols].to_excel(buf, index=False, engine='openpyxl')
-                buf.seek(0)
-                st.download_button("📥 엑셀 다운로드", data=buf,
-                                   file_name=f"수율이력_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   use_container_width=True)
+        n_deploys = len(unique_dates)
+        avg_yields = hist_df.drop_duplicates(subset=['배포일시','블록']).groupby('배포일시')['블록수율(%)'].mean()
+        total_avg = avg_yields.mean() if len(avg_yields) > 0 else 0
+        st.caption(f"총 {n_deploys}건 배포 | 평균 수율 {total_avg:.1f}%")
+
+        dc1, dc2, dc3 = st.columns([2, 1, 1])
+        with dc1:
+            del_idx = st.number_input("삭제할 배포No 입력", min_value=1, max_value=n_deploys,
+                                      value=1, step=1, key="del_log_no")
+        with dc2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("🗑️ 선택 삭제", key="del_log_btn", use_container_width=True):
+                if delete_deploy_rows_by_no(del_idx):
+                    st.toast(f"배포 #{del_idx} 삭제 완료")
+                    _get_gsheet.clear()  # 캐시 초기화
+                    st.rerun()
+        with dc3:
+            st.markdown("<br>", unsafe_allow_html=True)
+            buf = BytesIO()
+            hist_df[display_cols].to_excel(buf, index=False, engine='openpyxl')
+            buf.seek(0)
+            st.download_button("📥 엑셀 다운로드", data=buf,
+                               file_name=f"수율이력_{now_kst().strftime('%Y%m%d')}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True)
     else:
         st.info("배포 이력이 없습니다. '현장 배포' 버튼을 누르면 기록됩니다.")
 
@@ -995,7 +1021,7 @@ with st.expander("📡 ERP 발주 조회 → 수량 자동 반영", expanded=Fal
             df.to_excel(buf, index=False, engine='openpyxl')
             buf.seek(0)
             st.download_button("📊 엑셀 다운로드", data=buf,
-                               file_name=f"ERP발주조회_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                               file_name=f"ERP발주조회_{now_kst().strftime('%Y%m%d_%H%M')}.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                use_container_width=True)
 
