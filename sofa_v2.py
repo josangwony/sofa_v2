@@ -982,6 +982,38 @@ if VIEW_MODE == "floor":
 # 관리자 화면
 # ══════════════════════════════════════
 
+# ── URL에서 pono 자동 감지 (ERP → 앱 링크) ──
+try:
+    url_pono = st.query_params.get("pono", "")
+except AttributeError:
+    url_pono = st.experimental_get_query_params().get("pono", [""])[0]
+
+if url_pono and st.session_state.get('_auto_pono') != url_pono:
+    # 새 pono가 URL로 들어옴 → 자동 조회
+    st.session_state['_auto_pono'] = url_pono
+    with st.spinner(f"📡 구매의뢰 {url_pono} 자동 조회 중..."):
+        data, err = call_erp_query("PAN", url_pono)
+    if err:
+        st.error(err)
+    elif data:
+        st.session_state['_erp_data'] = data
+        st.session_state['_erp_pono'] = url_pono
+        st.session_state['_erp_storecd'] = "PAN"
+        # 자동 수량 세팅
+        qty_map = match_erp_to_items(data)
+        for code, qty in qty_map.items():
+            st.session_state[f"qty_{code}"] = qty
+        # before_result: 즉시 수율 계산 후 전송
+        saved_blocks_for_auto = load_saved()
+        ld_auto = [copy.deepcopy(s) for s in saved_blocks_for_auto] if saved_blocks_for_auto else None
+        auto_blocks = pack_items(qty_map, ld_auto)
+        if auto_blocks:
+            avg_y_before = sum(b.yield_pct() for b in auto_blocks) / len(auto_blocks)
+            before_result = round(avg_y_before, 2)
+            call_erp_update_before_result("PAN", url_pono, before_result)
+            st.toast(f"✅ 구매의뢰 {url_pono} 자동 로드 | 사전수율 {before_result}% 전송 완료")
+        st.rerun()
+
 total_items = sum(input_slots.values())
 
 # ── ERP 구매의뢰 조회 (항상 표시) ──
@@ -1111,7 +1143,7 @@ if total_items > 0:
     st.divider()
 
     # ── 재단 배치도 + 버튼 ──
-    hd1, hd2, hd3, hd4 = st.columns([7, 1.3, 1.3, 1.3])
+    hd1, hd2, hd3, hd4, hd5 = st.columns([5.5, 1.3, 1.3, 1.3, 1.3])
     with hd1:
         st.markdown("#### 📐 재단 배치도")
     with hd2:
@@ -1125,6 +1157,13 @@ if total_items > 0:
         def _trigger_deploy():
             st.session_state['_deploy_ts'] = datetime.now().isoformat()
         st.button("📡 현장 배포", key="deploy_btn", use_container_width=True, on_click=_trigger_deploy)
+    with hd5:
+        erp_pono = st.session_state.get('_erp_pono')
+        has_erp = bool(erp_pono and st.session_state.get('_erp_data'))
+        def _trigger_confirm():
+            st.session_state['_confirm_ts'] = datetime.now().isoformat()
+        st.button("✅ ERP 확정", key="confirm_btn", use_container_width=True,
+                  on_click=_trigger_confirm, disabled=not has_erp)
 
     # SVG 생성
     all_svgs = []
@@ -1194,6 +1233,34 @@ if total_items > 0:
         </script><!-- """ + deploy_ts + """ -->"""
         components.html(deploy_html, height=0)
         st.toast("✅ 현장 배포 완료! 새 창에서 배치도를 확인하세요.")
+
+    # ERP 확정: 각 자재별 update-poqty + after_result
+    confirm_ts = st.session_state.pop('_confirm_ts', None)
+    if confirm_ts:
+        erp_pono = st.session_state.get('_erp_pono', '')
+        erp_storecd = st.session_state.get('_erp_storecd', 'PAN')
+        erp_data = st.session_state.get('_erp_data', [])
+        avg_y_after = sum(b.yield_pct() for b in blocks) / len(blocks) if blocks else 0
+        after_result = round(avg_y_after, 2)
+
+        success_count = 0
+        errors = []
+        for row in erp_data:
+            matcd = row.get('matcd', '')
+            matcol = row.get('matcol', '')
+            po_seq = row.get('po_seq', 0)
+            poqty = row.get('poqty', 0)
+            _, err = call_erp_update_poqty(
+                erp_storecd, erp_pono, matcd, matcol, po_seq, poqty, after_result)
+            if err:
+                errors.append(f"{matcd}: {err}")
+            else:
+                success_count += 1
+
+        if errors:
+            st.error(f"⚠️ {len(errors)}건 오류: {'; '.join(errors[:3])}")
+        if success_count > 0:
+            st.toast(f"✅ ERP 확정 완료! {success_count}건 전송 | 최종수율 {after_result}%")
 
     # 인쇄: SVG만 담은 새 창
     print_ts = st.session_state.pop('_print_ts', None)
