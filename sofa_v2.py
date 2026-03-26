@@ -869,25 +869,34 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### 📋 품목별 생산 수량 입력")
-    st.caption("⚠️ 개수(ea) 직접 입력 — 단위 미만도 허용")
+    st.caption("개수(ea) 직접 입력 — 단위 미만도 허용")
     input_slots = {}
     for code, info in ITEM_MASTER.items():
         unit = info['unit']
         val  = st.session_state.get(f"qty_{code}", 0)
-        # 단위 불일치 경고 표시
-        warn_html = ""
-        if val > 0 and val % unit != 0:
-            blocks_needed = math.ceil(val / unit)
-            waste = blocks_needed * unit - val
-            warn_html = (f"<small style='color:#E67E22;'>⚠️ {unit}개 단위 불일치 "
-                         f"(+{waste}개 여유공간)</small>")
-        input_slots[code] = st.number_input(
-            f"[{code}] {info['matname']}",
-            min_value=0, step=1, key=f"qty_{code}",
-            help=f"📦 {info['matcd']}\n📐 {info['width']}×{info['depth']}×{info['height']}mm\n단위: {unit}개")
-        st.caption(f"단위: {unit}개")
-        if warn_html:
-            st.markdown(warn_html, unsafe_allow_html=True)
+        is_mismatch = val > 0 and val % unit != 0
+
+        # 입력 + 단위 표시를 한 줄에 배치
+        col_inp, col_tag = st.columns([3, 1])
+        with col_inp:
+            input_slots[code] = st.number_input(
+                f"[{code}] {info['matname']}",
+                min_value=0, step=1, key=f"qty_{code}",
+                help=f"📦 {info['matcd']}\n📐 {info['width']}×{info['depth']}×{info['height']}mm",
+                label_visibility="visible")
+        with col_tag:
+            if is_mismatch:
+                blocks_needed = math.ceil(val / unit)
+                waste = blocks_needed * unit - val
+                st.markdown(
+                    f"<div style='padding-top:28px;font-size:0.72rem;color:#E67E22;line-height:1.3;'>"
+                    f"단위:{unit}개<br>⚠️+{waste}</div>",
+                    unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    f"<div style='padding-top:28px;font-size:0.72rem;color:#9E9E9E;'>"
+                    f"단위:{unit}개</div>",
+                    unsafe_allow_html=True)
 
     st.divider()
     st.markdown("### 📦 저장된 잔여 블록")
