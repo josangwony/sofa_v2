@@ -850,8 +850,13 @@ if url_pono and st.session_state.get('_auto_pono') != url_pono:
         if auto_blocks:
             avg_y_before = sum(b.yield_pct() for b in auto_blocks) / len(auto_blocks)
             before_result = round(avg_y_before, 2)
-            call_erp_update_before_result("PAN", url_pono, before_result)
-            st.toast(f"✅ 구매의뢰 {url_pono} 자동 로드 | 사전수율 {before_result}% 전송 완료")
+            _, berr = call_erp_update_before_result("PAN", url_pono, before_result)
+            if berr:
+                st.warning(f"⚠️ 사전수율 전송 실패: {berr}")
+            else:
+                st.toast(f"✅ 구매의뢰 {url_pono} 자동 로드 | 사전수율 {before_result}% 전송 완료")
+        else:
+            st.warning("⚠️ 수량 데이터로 시뮬레이션 블록을 생성하지 못했습니다.")
         st.rerun()
 
 
