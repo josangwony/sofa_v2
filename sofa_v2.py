@@ -296,7 +296,7 @@ from google.oauth2.service_account import Credentials
 
 @st.cache_resource
 def _get_gsheet():
-    """Google Sheets 연결 (캐시)"""
+    """Google Sheets 연결"""
     try:
         creds_dict = dict(st.secrets["gcp_service_account"])
         creds = Credentials.from_service_account_info(creds_dict, scopes=[
@@ -304,11 +304,14 @@ def _get_gsheet():
             "https://www.googleapis.com/auth/drive"])
         gc = gspread.authorize(creds)
         sheet_id = st.secrets.get("SHEET_ID", "")
-        if sheet_id:
-            return gc.open_by_key(sheet_id)
+        if not sheet_id:
+            return None
+        wb = gc.open_by_key(sheet_id)
+        return wb
+    except KeyError as e:
+        return None
     except Exception as e:
-        st.sidebar.warning(f"⚠️ GSheet 연결 실패: {e}")
-    return None
+        return None
 
 def _gs_read(tab_name):
     """시트 탭에서 JSON 문자열 읽기"""
@@ -946,6 +949,13 @@ if VIEW_MODE == "floor":
 # ══════════════════════════════════════
 # 관리자 화면
 # ══════════════════════════════════════
+
+# Google Sheets 연결 상태 표시 (디버깅용 — 확인 후 삭제)
+_gs_status = _get_gsheet()
+if _gs_status:
+    st.success("✅ Google Sheets 연결됨")
+else:
+    st.warning("⚠️ Google Sheets 미연결 — 로컬 저장 모드")
 
 total_items = sum(input_slots.values())
 
