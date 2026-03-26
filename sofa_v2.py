@@ -1267,11 +1267,17 @@ if total_items > 0:
             waste     = blocks_n * unit - qty
             aligned_qty = blocks_n * unit  # unit의 정확한 배수
 
-            # 현재 수율: qty개 → 부분 조각 포함
-            # 단위 맞춤 수율: aligned_qty개 → 완전 조각만 (부분 조각 없음 → 빈공간 없음)
+            # 해당 품목의 부분 조각이 들어간 블록 수율 찾기
+            partial_block_yields = []
+            for b in blocks:
+                for it in b.items:
+                    if it['code'] == c and it.get('cnt', unit) < unit:
+                        partial_block_yields.append(b.yield_pct())
+                        break
+
+            # 단위 맞춤 후 전체 평균 수율
             aligned_slots = {k: v for k, v in input_slots.items()}
             aligned_slots[c] = aligned_qty
-            # ld를 새로 deep-copy해서 재사용 (ld는 위에서 이미 deep-copy됨)
             ld2 = [copy.deepcopy(s) for s in saved_blocks] if use_saved and saved_blocks else None
             aligned_blocks = pack_items(aligned_slots, ld2)
             aligned_y = (sum(b.yield_pct() for b in aligned_blocks) / len(aligned_blocks)
@@ -1282,6 +1288,7 @@ if total_items > 0:
                 'qty': qty, 'unit': unit,
                 'blocks_n': blocks_n, 'waste': waste,
                 'aligned_qty': aligned_qty, 'aligned_y': aligned_y,
+                'partial_block_yields': partial_block_yields,  # 부분조각 포함 블록 수율
             })
 
     # ── 메트릭 ──
@@ -1298,15 +1305,22 @@ if total_items > 0:
         st.markdown("##### ⚠️ 단위 불일치 품목 — 수율 비교")
         mc_cols = st.columns(len(mismatch_items)) if len(mismatch_items) <= 4 else st.columns(4)
         for idx, mi in enumerate(mismatch_items[:4]):
+            # avg_y: 현재 전체 평균 수율 / mi['aligned_y']: 단위 맞춤 후 전체 평균 수율
             delta_y = mi['aligned_y'] - avg_y
             with mc_cols[idx]:
+                # 부분조각 블록 수율 표시 문자열
+                pb_str = ""
+                if mi['partial_block_yields']:
+                    pb_vals = ", ".join(f"{y:.1f}%" for y in mi['partial_block_yields'])
+                    pb_str = f"<br><span style='color:#E67E22;font-size:0.75rem;'>⚠️ 부분조각 블록 수율: {pb_vals}</span>"
                 st.markdown(f"""
 <div style="background:#FFF8E1;border:1px solid #FFCC80;border-radius:8px;padding:10px;font-size:0.82rem;">
 <b>[{mi['code']}] {mi['matname']}</b><br>
-현재: <b>{mi['qty']}개</b> → {mi['blocks_n']}블록<br>
-<span style="color:#E67E22;">여유공간: +{mi['waste']}개</span><br>
-단위맞춤: <b>{mi['aligned_qty']}개</b>로 수정 시<br>
-수율 <b>{avg_y:.1f}%</b> → <b style="color:{"#27AE60" if delta_y>=0 else "#E74C3C"}">{mi['aligned_y']:.1f}%</b>
+현재: <b>{mi['qty']}개</b> ({mi['blocks_n']}블록, 여유 +{mi['waste']}개){pb_str}<br>
+단위맞춤 <b>{mi['aligned_qty']}개</b>로 수정 시:<br>
+<hr style="margin:4px 0;border:none;border-top:1px solid #FFE082;">
+<span style="color:#7A736B;font-size:0.75rem;">전체 평균 수율</span>
+<b>{avg_y:.1f}%</b> → <b style="color:{"#27AE60" if delta_y>=0 else "#E74C3C"}">{mi['aligned_y']:.1f}%</b>
 <span style="color:{"#27AE60" if delta_y>=0 else "#E74C3C"}">({delta_y:+.1f}%)</span>
 </div>""", unsafe_allow_html=True)
                 # 원클릭으로 단위 맞춤 수량 반영
