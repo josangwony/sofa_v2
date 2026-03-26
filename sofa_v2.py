@@ -306,8 +306,8 @@ def _get_gsheet():
         sheet_id = st.secrets.get("SHEET_ID", "")
         if sheet_id:
             return gc.open_by_key(sheet_id)
-    except Exception:
-        pass
+    except Exception as e:
+        st.sidebar.warning(f"⚠️ GSheet 연결 실패: {e}")
     return None
 
 def _gs_read(tab_name):
@@ -319,8 +319,8 @@ def _gs_read(tab_name):
             val = ws.acell('A1').value
             if val:
                 return json.loads(val)
-    except Exception:
-        pass
+    except Exception as e:
+        pass  # 읽기 실패는 조용히 (fallback 사용)
     return None
 
 def _gs_write(tab_name, data):
@@ -331,8 +331,8 @@ def _gs_write(tab_name, data):
             ws = wb.worksheet(tab_name)
             ws.update('A1', [[json.dumps(data, ensure_ascii=False)]])
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        st.toast(f"⚠️ GSheet 저장 실패: {e}")
     return False
 
 # ── 잔여 블록 ──
