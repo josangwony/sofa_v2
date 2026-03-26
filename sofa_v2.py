@@ -166,7 +166,15 @@ class Block:
         self.original_area = original_area
         self.original_bb = original_bb  # [x, y, w, h] 최초 저장 시 고정
 
-    def used_area(self): return sum(i['w']*i['h'] for i in self.items)
+    def used_area(self):
+        """실제 사용 면적 = 2D면적 × (실제개수/단위). 부분 조각은 비례 축소."""
+        total = 0
+        for i in self.items:
+            area = i['w'] * i['h']
+            unit = i.get('unit') or ITEM_MASTER[i['code']]['unit']
+            cnt  = i.get('cnt', unit)
+            total += area * (cnt / unit)
+        return total
 
     def total_area(self):
         if self.is_saved and self.original_area > 0:
@@ -205,10 +213,14 @@ class Block:
                         best = {'ri': i, 'w': w, 'h': h, 'rot': rot, 'score': sc}
         return best
 
-    def place_item(self, code, p):
+    def place_item(self, code, p, cnt=None):
+        """cnt: 이 조각에 실제 들어가는 개수. None이면 unit(완전 조각)으로 처리."""
         fr = self.free_rects[p['ri']]
         w, h = p['w'], p['h']
-        self.items.append({'code': code, 'x': fr.x, 'y': fr.y, 'w': w, 'h': h, 'rot': p['rot']})
+        unit = ITEM_MASTER[code]['unit']
+        actual_cnt = cnt if cnt is not None else unit
+        self.items.append({'code': code, 'x': fr.x, 'y': fr.y, 'w': w, 'h': h,
+                           'rot': p['rot'], 'cnt': actual_cnt, 'unit': unit})
         rw, rh = fr.w-w, fr.h-h
         rh_list, rv_list = [], []
         if rw > 0: rh_list.append(FreeRect(fr.x+w, fr.y, rw, fr.h))
@@ -296,11 +308,11 @@ def pack_items(order, saved=None):
             p = b.find_best_placement(info['width'], info['depth'])
             if p and (bp is None or p['score']<bp['score']): bb, bp = b, p
         if bb and bp:
-            item = bb.place_item(code, bp)
+            bb.place_item(code, bp, cnt=cnt)
         else:
             bc += 1; nb = Block(bc)
             p = nb.find_best_placement(info['width'], info['depth'])
-            if p: nb.place_item(code, p); blocks.append(nb)
+            if p: nb.place_item(code, p, cnt=cnt); blocks.append(nb)
     return blocks
 
 # ============================================================
@@ -869,15 +881,11 @@ with st.sidebar:
             waste = blocks_needed * unit - val
             warn_html = (f"<small style='color:#E67E22;'>⚠️ {unit}개 단위 불일치 "
                          f"(+{waste}개 여유공간)</small>")
-        col_a, col_b = st.columns([3, 1])
-        with col_a:
-            input_slots[code] = st.number_input(
-                f"[{code}] {info['matname']}",
-                min_value=0, step=1, key=f"qty_{code}",
-                help=f"📦 {info['matcd']}\n📐 {info['width']}×{info['depth']}×{info['height']}mm\n단위: {unit}개/블록")
-        with col_b:
-            st.markdown(f"<div style='padding-top:28px;color:#7A736B;font-size:0.78rem;'>×{unit}/블록</div>",
-                        unsafe_allow_html=True)
+        input_slots[code] = st.number_input(
+            f"[{code}] {info['matname']}",
+            min_value=0, step=1, key=f"qty_{code}",
+            help=f"📦 {info['matcd']}\n📐 {info['width']}×{info['depth']}×{info['height']}mm\n단위: {unit}개")
+        st.caption(f"단위: {unit}개")
         if warn_html:
             st.markdown(warn_html, unsafe_allow_html=True)
 
@@ -917,54 +925,41 @@ if st.session_state.get('_view_log'):
         st.session_state['_view_log'] = False
     st.button("← 시뮬레이션으로 돌아가기", key="back_from_log", on_click=_close_log)
 
-    # Google Sheets에서 행 단위로 읽기
+    # Google Sheets에서 행 단위로 읽기 (순서 기반 파싱)
+    # 시트 컬럼 순서: 배포일시(0) 블록수(1) 평균수율(2) 총생산수량(3)
+    #                블록넘버(4) 블록당수율(5) 자재코드(6) 자재명(7) 생산수량(8)
+    SHEET_COLS = ['배포일시','블록수','평균수율','총생산수량','블록넘버','블록당수율','자재코드','자재명','생산수량']
     sheet_rows = load_deploy_history_from_sheet()
     if sheet_rows:
-        hist_df = pd.DataFrame(sheet_rows)
+        # get_all_records()는 dict 반환 → values()로 순서 기반 재구성
+        rows_by_order = []
+        for row in sheet_rows:
+            vals = list(row.values())
+            # 컬럼 수가 맞지 않으면 빈 값으로 채움
+            while len(vals) < len(SHEET_COLS):
+                vals.append('')
+            rows_by_order.append(dict(zip(SHEET_COLS, vals[:len(SHEET_COLS)])))
+        hist_df = pd.DataFrame(rows_by_order)
 
-        # ── 컬럼명 정규화 (시트 헤더가 다를 경우 대비) ──
-        col_alias = {
-            # 가능한 다른 이름 → 표준 이름
-            'deployed_at': '배포일시', 'deploy_at': '배포일시',
-            'block': '블록', 'block_label': '블록',
-            'yield': '블록수율(%)', 'block_yield': '블록수율(%)', '블록수율': '블록수율(%)',
-            'matcd': '자재코드', 'mat_cd': '자재코드',
-            'matname': '품목명', 'mat_name': '품목명',
-            'unit': '생산수량', 'qty': '생산수량',
-        }
-        hist_df.rename(columns={k: v for k, v in col_alias.items()
-                                 if k in hist_df.columns and v not in hist_df.columns},
-                       inplace=True)
+        # 배포No 추가 (배포일시 기준 그룹)
+        unique_dates = []
+        for dt in hist_df['배포일시']:
+            if dt not in unique_dates:
+                unique_dates.append(dt)
+        hist_df['배포No'] = hist_df['배포일시'].map(lambda x: unique_dates.index(x)+1)
 
-        # '배포일시' 컬럼이 없으면 시트 구조가 달라진 것 → 안내
-        if '배포일시' not in hist_df.columns:
-            st.warning(f"⚠️ 시트 컬럼 구조가 예상과 다릅니다. 현재 컬럼: {list(hist_df.columns)}")
-            st.dataframe(hist_df, use_container_width=True, hide_index=True, height=400)
-        else:
-            # 배포No 추가 (배포일시 기준 그룹)
-            unique_dates = []
-            for dt in hist_df['배포일시']:
-                if dt not in unique_dates:
-                    unique_dates.append(dt)
-            hist_df['배포No'] = hist_df['배포일시'].map(lambda x: unique_dates.index(x)+1)
+        display_cols = ['배포No','배포일시','블록넘버','블록당수율','자재코드','자재명','생산수량']
+        st.dataframe(hist_df[display_cols], use_container_width=True, hide_index=True, height=500)
 
-            display_cols = ['배포No','배포일시','블록','블록수율(%)','자재코드','품목명','생산수량']
-            display_cols = [c for c in display_cols if c in hist_df.columns]
-
-            st.dataframe(hist_df[display_cols], use_container_width=True, hide_index=True, height=500)
-
-            n_deploys = len(unique_dates)
-            # '블록수율(%)' 컬럼이 있을 때만 평균 계산
-            if '블록수율(%)' in hist_df.columns and '블록' in hist_df.columns:
-                try:
-                    avg_yields = (hist_df.drop_duplicates(subset=['배포일시','블록'])
-                                  .groupby('배포일시')['블록수율(%)'].mean())
-                    total_avg = avg_yields.mean() if len(avg_yields) > 0 else 0
-                except Exception:
-                    total_avg = 0
-            else:
-                total_avg = 0
-            st.caption(f"총 {n_deploys}건 배포 | 평균 수율 {total_avg:.1f}%")
+        n_deploys = len(unique_dates)
+        try:
+            hist_df['블록당수율'] = pd.to_numeric(hist_df['블록당수율'], errors='coerce')
+            avg_yields = (hist_df.drop_duplicates(subset=['배포일시','블록넘버'])
+                          .groupby('배포일시')['블록당수율'].mean())
+            total_avg = avg_yields.mean() if len(avg_yields) > 0 else 0
+        except Exception:
+            total_avg = 0
+        st.caption(f"총 {n_deploys}건 배포 | 평균 수율 {total_avg:.1f}%")
 
         dc1, dc2, dc3 = st.columns([2, 1, 1])
         with dc1:
