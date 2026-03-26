@@ -746,7 +746,9 @@ def _place_in_block(bidx, code, unit):
         })
         st.session_state['_history'] = hist[-10:]  # 최대 10단계
     st.session_state['_rec'] = {'bidx': bidx, 'code': code}
-    st.session_state[f"qty_{code}"] = st.session_state.get(f"qty_{code}", 0) + 1
+    # 단위(unit)만큼 증가 — 단위 불일치 경고 방지
+    unit = ITEM_MASTER[code]['unit']
+    st.session_state[f"qty_{code}"] = st.session_state.get(f"qty_{code}", 0) + unit
 
 def _undo():
     """마지막 추천 취소"""
