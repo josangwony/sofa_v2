@@ -1192,44 +1192,37 @@ with st.expander("📡 ERP 구매의뢰 조회 → 수량 자동 반영", expand
             sel_unit  = ITEM_MASTER[MATCODE_TO_ITEM.get(sel_row.get('matcd',''), sel_row.get('matcd',''))]['unit'] \
                         if sel_row.get('matcd','') in MATCODE_TO_ITEM else 1
 
-            upd_c1, upd_c2, upd_c3 = st.columns([1, 1, 1])
+            upd_c1, upd_c2 = st.columns([2, 1])
             with upd_c1:
                 new_qty = st.number_input(
-                    f"수정 수량 (현재: {cur_qty}개, 단위: {sel_unit}개/블록)",
+                    f"수정 수량 (현재: {cur_qty}개 / 단위: {sel_unit}개)",
                     min_value=0, value=cur_qty, step=1, key="upd_qty")
             with upd_c2:
-                # after_result: 현재 시뮬레이션 평균 수율 자동 채움
-                _cur_blocks = st.session_state.get('_blocks', [])
-                _auto_yield = round(sum(b.yield_pct() for b in _cur_blocks)/len(_cur_blocks), 2) if _cur_blocks else 0.0
-                after_res = st.number_input(
-                    "사후검사 결과 (%)", min_value=0.0, max_value=100.0,
-                    value=_auto_yield, step=0.1, key="upd_after",
-                    help="현재 시뮬레이션 평균 수율이 자동으로 채워집니다.")
-            with upd_c3:
                 st.markdown("<br>", unsafe_allow_html=True)
-                upd_btn = st.button("📤 ERP 전송", key="upd_send", use_container_width=True)
+                upd_btn = st.button("📤 전송", key="upd_send", use_container_width=True)
 
-            # 단위 불일치 경고
             if new_qty > 0 and new_qty % sel_unit != 0:
                 waste_upd = math.ceil(new_qty / sel_unit) * sel_unit - new_qty
-                st.warning(f"⚠️ 단위 불일치: {sel_unit}개 단위 기준 +{waste_upd}개 여유공간 발생")
+                st.warning(f"⚠️ 단위 불일치 — +{waste_upd}개 여유공간 발생")
             elif new_qty > 0:
-                st.success(f"✅ 단위 일치: {new_qty // sel_unit}블록 정확히 생산")
+                st.success(f"✅ 단위 일치: {new_qty // sel_unit}블록")
 
             if upd_btn:
+                # after_result: 현재 시뮬레이션 수율 자동 사용 (없으면 0)
+                _cur_blocks = st.session_state.get('_blocks', [])
+                _cur_yield  = round(sum(b.yield_pct() for b in _cur_blocks) / len(_cur_blocks), 2)                               if _cur_blocks else 0.0
                 _, err = call_erp_update_poqty(
                     erp_store_cur, erp_pono_cur,
                     sel_row.get('matcd',''), sel_row.get('matcol','XX'),
-                    sel_row.get('po_seq', 0), new_qty, after_res)
+                    sel_row.get('po_seq', 0), new_qty, _cur_yield)
                 if err:
                     st.error(f"전송 실패: {err}")
                 else:
-                    # 로컬 erp_data 캐시도 업데이트
                     for r in st.session_state['_erp_data']:
                         if r.get('po_seq') == sel_row.get('po_seq') and r.get('matcd') == sel_row.get('matcd'):
                             r['poqty'] = new_qty
                             break
-                    st.success(f"✅ ERP 전송 완료 — {sel_row.get('matcd','')} 수량 {cur_qty} → {new_qty}개 | 사후수율 {after_res}%")
+                    st.success(f"✅ 수량 수정 전송 완료 — {sel_row.get('matcd','')} {cur_qty} → {new_qty}개 | 수율 {_cur_yield}%")
                     st.rerun()
 
 if total_items > 0:
@@ -1466,22 +1459,29 @@ if total_items > 0:
         components.html(deploy_html, height=0)
         st.toast("✅ 현장 배포 완료! 새 창에서 배치도를 확인하세요.")
 
-    # ERP 확정: 각 자재별 update-poqty + after_result
+    # ERP 확정: 최종 확정 수량(poqty) + 시뮬레이션 수율(after_result) 함께 전송
+    # poqty = 사이드바에서 최종 조정된 개수 (input_slots 기준)
+    # after_result = 현재 시뮬레이션 평균 수율
     confirm_ts = st.session_state.pop('_confirm_ts', None)
     if confirm_ts:
-        erp_pono = st.session_state.get('_erp_pono', '')
+        erp_pono    = st.session_state.get('_erp_pono', '')
         erp_storecd = st.session_state.get('_erp_storecd', 'PAN')
-        erp_data = st.session_state.get('_erp_data', [])
-        avg_y_after = sum(b.yield_pct() for b in blocks) / len(blocks) if blocks else 0
+        erp_data    = st.session_state.get('_erp_data', [])
+        avg_y_after  = sum(b.yield_pct() for b in blocks) / len(blocks) if blocks else 0
         after_result = round(avg_y_after, 2)
 
         success_count = 0
         errors = []
         for row in erp_data:
-            matcd = row.get('matcd', '')
+            matcd  = row.get('matcd', '')
             matcol = row.get('matcol', '')
             po_seq = row.get('po_seq', 0)
-            poqty = row.get('poqty', 0)
+            # 사이드바 최종 수량 우선 사용, 매칭 안 되면 원본 발주 수량 fallback
+            item_code = MATCODE_TO_ITEM.get(matcd)
+            if item_code and item_code in input_slots:
+                poqty = input_slots[item_code]   # ← 사이드바 최종 조정값
+            else:
+                poqty = row.get('poqty', 0)      # ← fallback: 원본 발주 수량
             _, err = call_erp_update_poqty(
                 erp_storecd, erp_pono, matcd, matcol, po_seq, poqty, after_result)
             if err:
