@@ -305,32 +305,30 @@ def _get_gsheet():
         gc = gspread.authorize(creds)
         sheet_id = st.secrets.get("SHEET_ID", "")
         if not sheet_id:
-            return None
+            return "ERR: SHEET_ID 없음"
         wb = gc.open_by_key(sheet_id)
         return wb
-    except KeyError as e:
-        return None
     except Exception as e:
-        return None
+        return f"ERR: {e}"
 
 def _gs_read(tab_name):
     """시트 탭에서 JSON 문자열 읽기"""
     try:
         wb = _get_gsheet()
-        if wb:
+        if wb and not isinstance(wb, str):
             ws = wb.worksheet(tab_name)
             val = ws.acell('A1').value
             if val:
                 return json.loads(val)
-    except Exception as e:
-        pass  # 읽기 실패는 조용히 (fallback 사용)
+    except Exception:
+        pass
     return None
 
 def _gs_write(tab_name, data):
     """시트 탭에 JSON 문자열 쓰기"""
     try:
         wb = _get_gsheet()
-        if wb:
+        if wb and not isinstance(wb, str):
             ws = wb.worksheet(tab_name)
             ws.update('A1', [[json.dumps(data, ensure_ascii=False)]])
             return True
@@ -952,7 +950,9 @@ if VIEW_MODE == "floor":
 
 # Google Sheets 연결 상태 표시 (디버깅용 — 확인 후 삭제)
 _gs_status = _get_gsheet()
-if _gs_status:
+if isinstance(_gs_status, str):
+    st.error(f"Google Sheets: {_gs_status}")
+elif _gs_status:
     st.success("✅ Google Sheets 연결됨")
 else:
     st.warning("⚠️ Google Sheets 미연결 — 로컬 저장 모드")
