@@ -297,7 +297,6 @@ from google.oauth2.service_account import Credentials
 @st.cache_resource
 def _get_gsheet():
     """Google Sheets 연결"""
-    import traceback
     try:
         creds_dict = dict(st.secrets["gcp_service_account"])
         creds = Credentials.from_service_account_info(creds_dict, scopes=[
@@ -306,17 +305,16 @@ def _get_gsheet():
         gc = gspread.authorize(creds)
         sheet_id = st.secrets.get("SHEET_ID", "")
         if not sheet_id:
-            return "ERR: SHEET_ID 없음"
-        wb = gc.open_by_key(sheet_id)
-        return wb
-    except Exception as e:
-        return f"ERR: {type(e).__name__}: {e}\n{traceback.format_exc()[-300:]}"
+            return None
+        return gc.open_by_key(sheet_id)
+    except Exception:
+        return None
 
 def _gs_read(tab_name):
     """시트 탭에서 JSON 문자열 읽기"""
     try:
         wb = _get_gsheet()
-        if wb and not isinstance(wb, str):
+        if wb:
             ws = wb.worksheet(tab_name)
             val = ws.acell('A1').value
             if val:
@@ -329,12 +327,12 @@ def _gs_write(tab_name, data):
     """시트 탭에 JSON 문자열 쓰기"""
     try:
         wb = _get_gsheet()
-        if wb and not isinstance(wb, str):
+        if wb:
             ws = wb.worksheet(tab_name)
             ws.update('A1', [[json.dumps(data, ensure_ascii=False)]])
             return True
-    except Exception as e:
-        st.toast(f"⚠️ GSheet 저장 실패: {e}")
+    except Exception:
+        pass
     return False
 
 # ── 잔여 블록 ──
@@ -948,15 +946,6 @@ if VIEW_MODE == "floor":
 # ══════════════════════════════════════
 # 관리자 화면
 # ══════════════════════════════════════
-
-# Google Sheets 연결 상태 표시 (디버깅용 — 확인 후 삭제)
-_gs_status = _get_gsheet()
-if isinstance(_gs_status, str):
-    st.error(f"Google Sheets: {_gs_status}")
-elif _gs_status:
-    st.success("✅ Google Sheets 연결됨")
-else:
-    st.warning("⚠️ Google Sheets 미연결 — 로컬 저장 모드")
 
 total_items = sum(input_slots.values())
 
