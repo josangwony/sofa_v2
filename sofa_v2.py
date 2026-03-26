@@ -297,6 +297,7 @@ from google.oauth2.service_account import Credentials
 @st.cache_resource
 def _get_gsheet():
     """Google Sheets 연결"""
+    import traceback
     try:
         creds_dict = dict(st.secrets["gcp_service_account"])
         creds = Credentials.from_service_account_info(creds_dict, scopes=[
@@ -309,7 +310,7 @@ def _get_gsheet():
         wb = gc.open_by_key(sheet_id)
         return wb
     except Exception as e:
-        return f"ERR: {e}"
+        return f"ERR: {type(e).__name__}: {e}\n{traceback.format_exc()[-300:]}"
 
 def _gs_read(tab_name):
     """시트 탭에서 JSON 문자열 읽기"""
