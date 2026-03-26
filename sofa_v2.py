@@ -20,14 +20,14 @@ BLOCK_DEPTH = 600
 BLOCK_AREA = BLOCK_W * BLOCK_H
 
 STORAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-# 경로에 특수문자/한글 포함 시 대비
 try:
     os.makedirs(STORAGE_DIR, exist_ok=True)
 except OSError:
-    # 한글 경로 문제 시 사용자 홈 폴더에 저장
     STORAGE_DIR = os.path.join(os.path.expanduser("~"), ".sofa_sim_data")
     os.makedirs(STORAGE_DIR, exist_ok=True)
 STORAGE_FILE = os.path.join(STORAGE_DIR, "residual_blocks.json")
+PLAN_FILE = os.path.join(STORAGE_DIR, "current_plan.json")
+DEPLOY_LOG_FILE = os.path.join(STORAGE_DIR, "deploy_history.json")
 
 ITEM_MASTER = {
     'A': {'matname': '케렌시아 1인',         'matcd': 'OPFW005348-R000', 'matcol': 'XX', 'width': 550,  'depth': 480, 'height': 70,  'color': '#E74C3C'},
@@ -52,14 +52,28 @@ for code, info in ITEM_MASTER.items():
     MATCODE_TO_ITEM[info['matcd']] = code
 
 # ============================================================
-# ERP API 설정 (.env에서 로드)
+# ERP API 설정 (Streamlit Cloud: st.secrets / 로컬: .env)
 # ============================================================
-from dotenv import load_dotenv
-load_dotenv()
+def _get_secret(key, default=""):
+    """st.secrets → os.getenv → default 순으로 탐색"""
+    try:
+        return st.secrets[key]
+    except (KeyError, FileNotFoundError, AttributeError):
+        pass
+    val = os.getenv(key)
+    if val:
+        return val
+    return default
 
-ERP_API_URL = os.getenv("ERP_API_URL", "https://dev-erp-api2.fursys.com/api/erp/v1/material-order/list")
-ERP_AUTH_KEY = os.getenv("ERP_AUTH_KEY", "")
-ERP_IDENTIFIER = os.getenv("ERP_IDENTIFIER", "erp_admin")
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # Streamlit Cloud에서는 python-dotenv 없어도 됨
+
+ERP_API_URL = _get_secret("ERP_API_URL", "https://dev-erp-api2.fursys.com/api/erp/v1/material-order/list")
+ERP_AUTH_KEY = _get_secret("ERP_AUTH_KEY")
+ERP_IDENTIFIER = _get_secret("ERP_IDENTIFIER", "erp_admin")
 
 def call_erp_api(storecd="PAN", customcd="T01IAN", mat_list=None):
     """ERP 자재발주 조회 API 호출"""
@@ -275,46 +289,106 @@ def get_recommendations(blocks):
     return out
 
 # ============================================================
-# 4. 저장/로드
+# 4. 저장/로드 (Google Sheets + 로컬 fallback)
 # ============================================================
+import gspread
+from google.oauth2.service_account import Credentials
+
+@st.cache_resource
+def _get_gsheet():
+    """Google Sheets 연결 (캐시)"""
+    try:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = Credentials.from_service_account_info(creds_dict, scopes=[
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive"])
+        gc = gspread.authorize(creds)
+        sheet_id = st.secrets.get("SHEET_ID", "")
+        if sheet_id:
+            return gc.open_by_key(sheet_id)
+    except Exception:
+        pass
+    return None
+
+def _gs_read(tab_name):
+    """시트 탭에서 JSON 문자열 읽기"""
+    try:
+        wb = _get_gsheet()
+        if wb:
+            ws = wb.worksheet(tab_name)
+            val = ws.acell('A1').value
+            if val:
+                return json.loads(val)
+    except Exception:
+        pass
+    return None
+
+def _gs_write(tab_name, data):
+    """시트 탭에 JSON 문자열 쓰기"""
+    try:
+        wb = _get_gsheet()
+        if wb:
+            ws = wb.worksheet(tab_name)
+            ws.update('A1', [[json.dumps(data, ensure_ascii=False)]])
+            return True
+    except Exception:
+        pass
+    return False
+
+# ── 잔여 블록 ──
 def load_saved():
+    # Google Sheets 우선
+    data = _gs_read('residual_blocks')
+    if data and isinstance(data, list):
+        try:
+            return [Block.from_dict(d) for d in data]
+        except: pass
+    # 로컬 fallback
     if os.path.exists(STORAGE_FILE):
         try:
             with open(STORAGE_FILE,'r',encoding='utf-8') as f:
                 return [Block.from_dict(d) for d in json.load(f)]
-        except: return []
+        except: pass
     return []
 
 def _save_raw(data):
-    os.makedirs(STORAGE_DIR, exist_ok=True)
-    tmp = STORAGE_FILE + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    # atomic rename
-    import shutil
-    shutil.move(tmp, STORAGE_FILE)
+    # Google Sheets 저장
+    _gs_write('residual_blocks', data)
+    # 로컬도 저장
+    try:
+        os.makedirs(STORAGE_DIR, exist_ok=True)
+        with open(STORAGE_FILE,'w',encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except: pass
 
 def add_saved(block):
     raw = []
-    if os.path.exists(STORAGE_FILE):
-        with open(STORAGE_FILE,'r',encoding='utf-8') as f: raw = json.load(f)
+    gs_data = _gs_read('residual_blocks')
+    if gs_data and isinstance(gs_data, list):
+        raw = gs_data
+    elif os.path.exists(STORAGE_FILE):
+        try:
+            with open(STORAGE_FILE,'r',encoding='utf-8') as f: raw = json.load(f)
+        except: pass
     nid = max((d['id'] for d in raw), default=0)+1
     d = block.to_dict(); d['id']=nid; d['is_saved']=True
     d['saved_date'] = datetime.now().strftime('%Y-%m-%d %H:%M')
     raw.append(d); _save_raw(raw)
 
 def remove_saved(bid):
-    if os.path.exists(STORAGE_FILE):
-        with open(STORAGE_FILE,'r',encoding='utf-8') as f: raw = json.load(f)
-        _save_raw([d for d in raw if d['id']!=bid])
+    raw = []
+    gs_data = _gs_read('residual_blocks')
+    if gs_data and isinstance(gs_data, list):
+        raw = gs_data
+    elif os.path.exists(STORAGE_FILE):
+        try:
+            with open(STORAGE_FILE,'r',encoding='utf-8') as f: raw = json.load(f)
+        except: pass
+    _save_raw([d for d in raw if d['id']!=bid])
 
-# ── 현장 배포용 저장/로드 ──
-PLAN_FILE = os.path.join(STORAGE_DIR, "current_plan.json")
-DEPLOY_LOG_FILE = os.path.join(STORAGE_DIR, "deploy_history.json")
-
+# ── 현장 배포 + 이력 ──
 def save_plan(blocks, input_slots):
     """관리자가 확정한 재단 계획 저장 + 이력 기록"""
-    os.makedirs(STORAGE_DIR, exist_ok=True)
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     avg_y = sum(b.yield_pct() for b in blocks) / len(blocks) if blocks else 0
     total_u = sum(input_slots.get(c,0) * ITEM_MASTER[c]['unit'] for c in ITEM_MASTER if input_slots.get(c,0)>0)
@@ -324,10 +398,15 @@ def save_plan(blocks, input_slots):
         'input_slots': {c: input_slots.get(c, 0) for c in ITEM_MASTER},
         'blocks': [b.to_dict() for b in blocks],
     }
-    with open(PLAN_FILE, 'w', encoding='utf-8') as f:
-        json.dump(plan, f, ensure_ascii=False, indent=2)
+    # Google Sheets + 로컬
+    _gs_write('current_plan', plan)
+    try:
+        os.makedirs(STORAGE_DIR, exist_ok=True)
+        with open(PLAN_FILE, 'w', encoding='utf-8') as f:
+            json.dump(plan, f, ensure_ascii=False, indent=2)
+    except: pass
 
-    # 배포 이력 추가 — 블록별 기록
+    # 배포 이력 — 블록별 기록
     block_logs = []
     for bi, b in enumerate(blocks):
         block_items = []
@@ -338,46 +417,76 @@ def save_plan(blocks, input_slots):
                     'matcd': info['matcd'], 'matcol': info['matcol'],
                     'matname': info['matname'], 'unit': info['unit'],
                 })
-        label = f"잔여" if b.is_saved else f"Block"
+        label = "잔여" if b.is_saved else "Block"
         block_logs.append({
-            'block_no': bi+1,
-            'block_type': label,
-            'yield': round(b.yield_pct(), 1),
-            'items': block_items,
+            'block_no': bi+1, 'block_type': label,
+            'yield': round(b.yield_pct(), 1), 'items': block_items,
         })
 
     log_entry = {
-        'deployed_at': now,
-        'n_blocks': len(blocks),
-        'avg_yield': round(avg_y, 1),
-        'total_units': total_u,
+        'deployed_at': now, 'n_blocks': len(blocks),
+        'avg_yield': round(avg_y, 1), 'total_units': total_u,
         'blocks': block_logs,
     }
-    history = []
-    if os.path.exists(DEPLOY_LOG_FILE):
+
+    # 이력 로드
+    history = _gs_read('deploy_history') or []
+    if not isinstance(history, list):
+        history = []
+    if not history:
         try:
-            with open(DEPLOY_LOG_FILE, 'r', encoding='utf-8') as f:
-                history = json.load(f)
-        except: pass
+            if os.path.exists(DEPLOY_LOG_FILE):
+                with open(DEPLOY_LOG_FILE,'r',encoding='utf-8') as f:
+                    history = json.load(f)
+        except: history = []
+
     history.append(log_entry)
-    history = history[-50:]  # 최근 50건만 유지
-    with open(DEPLOY_LOG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
+    history = history[-50:]
+
+    # 이력 저장
+    _gs_write('deploy_history', history)
+    try:
+        with open(DEPLOY_LOG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except: pass
 
 def load_plan():
     """저장된 재단 계획 로드"""
-    if os.path.exists(PLAN_FILE):
+    plan = _gs_read('current_plan')
+    if not plan:
         try:
-            with open(PLAN_FILE, 'r', encoding='utf-8') as f:
-                plan = json.load(f)
-            blocks = [Block.from_dict(d) for d in plan.get('blocks', [])]
-            # from_dict가 is_saved=True로 설정하므로 원복
+            if os.path.exists(PLAN_FILE):
+                with open(PLAN_FILE,'r',encoding='utf-8') as f:
+                    plan = json.load(f)
+        except: plan = None
+    if plan:
+        try:
+            blocks = [Block.from_dict(d) for d in plan.get('blocks',[])]
             for b in blocks:
                 b.is_saved = False
             return plan, blocks
-        except Exception:
-            return None, []
+        except: pass
     return None, []
+
+def load_deploy_history():
+    """배포 이력 로드"""
+    history = _gs_read('deploy_history')
+    if history and isinstance(history, list):
+        return history
+    try:
+        if os.path.exists(DEPLOY_LOG_FILE):
+            with open(DEPLOY_LOG_FILE,'r',encoding='utf-8') as f:
+                return json.load(f)
+    except: pass
+    return []
+
+def save_deploy_history(history):
+    """배포 이력 저장"""
+    _gs_write('deploy_history', history)
+    try:
+        with open(DEPLOY_LOG_FILE,'w',encoding='utf-8') as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except: pass
 
 # ============================================================
 # 5. SVG 시각화
@@ -590,7 +699,7 @@ header[data-testid="stHeader"]::after {
     color: #7A736B;
     letter-spacing: 0.5px;
 }
-.block-container { padding-top: 4rem !important; }
+.block-container { padding-top: 2.5rem !important; }
 /* 사이드바 상단 여백 강제 제거 */
 section[data-testid="stSidebar"] > div { padding-top: 0rem !important; margin-top: 0 !important; }
 section[data-testid="stSidebar"] .block-container { padding-top: 0 !important; }
@@ -672,91 +781,80 @@ if st.session_state.get('_view_log'):
         st.session_state['_view_log'] = False
     st.button("← 시뮬레이션으로 돌아가기", key="back_from_log", on_click=_close_log)
 
-    if os.path.exists(DEPLOY_LOG_FILE):
-        try:
-            with open(DEPLOY_LOG_FILE, 'r', encoding='utf-8') as f:
-                history = json.load(f)
-            if history:
-                # 블록별 → 품목별로 행 전개
-                rows = []
-                for i, h in enumerate(history):
-                    deploy_no = i + 1
-                    dt = h['deployed_at']
+    history = load_deploy_history()
+    if history:
+            # 블록별 → 품목별로 행 전개
+            rows = []
+            for i, h in enumerate(history):
+                deploy_no = i + 1
+                dt = h['deployed_at']
 
-                    # 새 포맷 (blocks 배열)
-                    if 'blocks' in h:
-                        for bl in h['blocks']:
-                            if bl.get('items'):
-                                for item in bl['items']:
-                                    rows.append({
-                                        '배포No': deploy_no, '배포일시': dt,
-                                        '블록': f"{bl['block_type']} #{bl['block_no']}",
-                                        '블록수율(%)': bl['yield'],
-                                        '자재코드': item.get('matcd',''),
-                                        '색상': item.get('matcol',''),
-                                        '품목명': item.get('matname',''),
-                                        '생산수량': item.get('unit', ''),
-                                    })
-                            else:
+                if 'blocks' in h:
+                    for bl in h['blocks']:
+                        if bl.get('items'):
+                            for item in bl['items']:
                                 rows.append({
                                     '배포No': deploy_no, '배포일시': dt,
                                     '블록': f"{bl['block_type']} #{bl['block_no']}",
                                     '블록수율(%)': bl['yield'],
+                                    '자재코드': item.get('matcd',''),
+                                    '색상': item.get('matcol',''),
+                                    '품목명': item.get('matname',''),
+                                    '생산수량': item.get('unit', ''),
                                 })
-                    # 이전 포맷 호환
-                    elif h.get('items_detail'):
-                        for d in h['items_detail']:
+                        else:
+                            rows.append({
+                                '배포No': deploy_no, '배포일시': dt,
+                                '블록': f"{bl['block_type']} #{bl['block_no']}",
+                                '블록수율(%)': bl['yield'],
+                            })
+                elif h.get('items_detail'):
+                    for d in h['items_detail']:
+                        rows.append({
+                            '배포No': deploy_no, '배포일시': dt,
+                            '블록': '-', '블록수율(%)': h.get('avg_yield',''),
+                            '자재코드': d.get('matcd',''), '색상': d.get('matcol',''),
+                            '품목명': d.get('matname',''), '생산수량': d.get('qty',''),
+                        })
+                elif h.get('items'):
+                    for k, v in h['items'].items():
+                        if k in ITEM_MASTER:
+                            info = ITEM_MASTER[k]
                             rows.append({
                                 '배포No': deploy_no, '배포일시': dt,
                                 '블록': '-', '블록수율(%)': h.get('avg_yield',''),
-                                '자재코드': d.get('matcd',''), '색상': d.get('matcol',''),
-                                '품목명': d.get('matname',''), '생산수량': d.get('qty',''),
+                                '자재코드': info['matcd'], '색상': info['matcol'],
+                                '품목명': info['matname'], '생산수량': v,
                             })
-                    elif h.get('items'):
-                        for k, v in h['items'].items():
-                            if k in ITEM_MASTER:
-                                info = ITEM_MASTER[k]
-                                rows.append({
-                                    '배포No': deploy_no, '배포일시': dt,
-                                    '블록': '-', '블록수율(%)': h.get('avg_yield',''),
-                                    '자재코드': info['matcd'], '색상': info['matcol'],
-                                    '품목명': info['matname'], '생산수량': v,
-                                })
 
-                hist_df = pd.DataFrame(rows)
-                display_cols = ['배포No','배포일시','블록','블록수율(%)','자재코드','색상','품목명','생산수량']
-                display_cols = [c for c in display_cols if c in hist_df.columns]
+            hist_df = pd.DataFrame(rows)
+            display_cols = ['배포No','배포일시','블록','블록수율(%)','자재코드','색상','품목명','생산수량']
+            display_cols = [c for c in display_cols if c in hist_df.columns]
 
-                st.dataframe(hist_df[display_cols], use_container_width=True, hide_index=True, height=500)
-                st.caption(f"총 {len(history)}건 배포 | 평균 수율 {sum(h['avg_yield'] for h in history)/len(history):.1f}%")
+            st.dataframe(hist_df[display_cols], use_container_width=True, hide_index=True, height=500)
+            st.caption(f"총 {len(history)}건 배포 | 평균 수율 {sum(h['avg_yield'] for h in history)/len(history):.1f}%")
 
-                # 삭제 + 다운로드
-                dc1, dc2, dc3 = st.columns([2, 1, 1])
-                with dc1:
-                    del_idx = st.number_input("삭제할 No 입력", min_value=1, max_value=len(history),
-                                              value=1, step=1, key="del_log_no")
-                with dc2:
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    if st.button("🗑️ 선택 삭제", key="del_log_btn", use_container_width=True):
-                        actual_idx = len(history) - del_idx
-                        if 0 <= actual_idx < len(history):
-                            history.pop(actual_idx)
-                            with open(DEPLOY_LOG_FILE, 'w', encoding='utf-8') as f:
-                                json.dump(history, f, ensure_ascii=False, indent=2)
-                            st.rerun()
-                with dc3:
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    buf = BytesIO()
-                    hist_df[display_cols].to_excel(buf, index=False, engine='openpyxl')
-                    buf.seek(0)
-                    st.download_button("📥 엑셀 다운로드", data=buf,
-                                       file_name=f"수율이력_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                       use_container_width=True)
-            else:
-                st.info("배포 이력이 없습니다.")
-        except Exception as e:
-            st.error(f"이력 로드 오류: {e}")
+            dc1, dc2, dc3 = st.columns([2, 1, 1])
+            with dc1:
+                del_idx = st.number_input("삭제할 No 입력", min_value=1, max_value=len(history),
+                                          value=1, step=1, key="del_log_no")
+            with dc2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("🗑️ 선택 삭제", key="del_log_btn", use_container_width=True):
+                    actual_idx = del_idx - 1
+                    if 0 <= actual_idx < len(history):
+                        history.pop(actual_idx)
+                        save_deploy_history(history)
+                        st.rerun()
+            with dc3:
+                st.markdown("<br>", unsafe_allow_html=True)
+                buf = BytesIO()
+                hist_df[display_cols].to_excel(buf, index=False, engine='openpyxl')
+                buf.seek(0)
+                st.download_button("📥 엑셀 다운로드", data=buf,
+                                   file_name=f"수율이력_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   use_container_width=True)
     else:
         st.info("배포 이력이 없습니다. '현장 배포' 버튼을 누르면 기록됩니다.")
 
@@ -938,7 +1036,7 @@ if total_items > 0:
 
     # ── 추천 품목 (콤팩트 그리드) ──
     if recs:
-        st.markdown("##### 💡 빈 공간 추천 <small style='color:#AAA;font-weight:400'>",
+        st.markdown("##### 💡 빈 공간 추천 <small style='color:#AAA;font-weight:400'>(마우스 올리면 상세)</small>",
                     unsafe_allow_html=True)
         NC = 5  # 고정 5칸
         # 헤더
@@ -1157,6 +1255,7 @@ else:
     st.session_state.pop('_history', None)
     st.markdown("""
     <div style="text-align:center; padding:40px 20px; color:#BDC3C7;">
+        <div style="font-size:3.5rem;">📐</div>
         <h2 style="color:#95A5A6;">발주 수량을 입력하세요</h2>
         <p>👈 왼쪽 사이드바에서 품목별 수량 입력 시 시뮬레이션이 시작됩니다.</p>
         <p style="font-size:0.85rem; color:#CCC; margin-top:20px;">☎️ 문의: 생산팀 조상원</p>
