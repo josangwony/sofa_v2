@@ -783,6 +783,40 @@ for code in ITEM_MASTER:
     if f"qty_{code}" not in st.session_state:
         st.session_state[f"qty_{code}"] = 0
 
+# ── URL에서 pono 자동 감지 (ERP → 앱 링크) ──
+# 반드시 사이드바(number_input 위젯) 렌더링 전에 session_state를 세팅해야
+# StreamlitAPIException("widget key already exists") 오류를 방지할 수 있음
+try:
+    url_pono = st.query_params.get("pono", "")
+except AttributeError:
+    url_pono = st.experimental_get_query_params().get("pono", [""])[0]
+
+if url_pono and st.session_state.get('_auto_pono') != url_pono:
+    # 새 pono가 URL로 들어옴 → 자동 조회
+    st.session_state['_auto_pono'] = url_pono
+    with st.spinner(f"📡 구매의뢰 {url_pono} 자동 조회 중..."):
+        data, err = call_erp_query("PAN", url_pono)
+    if err:
+        st.error(err)
+    elif data:
+        st.session_state['_erp_data'] = data
+        st.session_state['_erp_pono'] = url_pono
+        st.session_state['_erp_storecd'] = "PAN"
+        # 위젯 렌더링 전이므로 session_state 직접 할당 가능
+        qty_map = match_erp_to_items(data)
+        for code, qty in qty_map.items():
+            st.session_state[f"qty_{code}"] = qty
+        # before_result: 즉시 수율 계산 후 전송
+        saved_blocks_for_auto = load_saved()
+        ld_auto = [copy.deepcopy(s) for s in saved_blocks_for_auto] if saved_blocks_for_auto else None
+        auto_blocks = pack_items(qty_map, ld_auto)
+        if auto_blocks:
+            avg_y_before = sum(b.yield_pct() for b in auto_blocks) / len(auto_blocks)
+            before_result = round(avg_y_before, 2)
+            call_erp_update_before_result("PAN", url_pono, before_result)
+            st.toast(f"✅ 구매의뢰 {url_pono} 자동 로드 | 사전수율 {before_result}% 전송 완료")
+        st.rerun()
+
 
 # ============================================================
 # 9. 사이드바
@@ -981,38 +1015,6 @@ if VIEW_MODE == "floor":
 # ══════════════════════════════════════
 # 관리자 화면
 # ══════════════════════════════════════
-
-# ── URL에서 pono 자동 감지 (ERP → 앱 링크) ──
-try:
-    url_pono = st.query_params.get("pono", "")
-except AttributeError:
-    url_pono = st.experimental_get_query_params().get("pono", [""])[0]
-
-if url_pono and st.session_state.get('_auto_pono') != url_pono:
-    # 새 pono가 URL로 들어옴 → 자동 조회
-    st.session_state['_auto_pono'] = url_pono
-    with st.spinner(f"📡 구매의뢰 {url_pono} 자동 조회 중..."):
-        data, err = call_erp_query("PAN", url_pono)
-    if err:
-        st.error(err)
-    elif data:
-        st.session_state['_erp_data'] = data
-        st.session_state['_erp_pono'] = url_pono
-        st.session_state['_erp_storecd'] = "PAN"
-        # 자동 수량 세팅
-        qty_map = match_erp_to_items(data)
-        for code, qty in qty_map.items():
-            st.session_state[f"qty_{code}"] = qty
-        # before_result: 즉시 수율 계산 후 전송
-        saved_blocks_for_auto = load_saved()
-        ld_auto = [copy.deepcopy(s) for s in saved_blocks_for_auto] if saved_blocks_for_auto else None
-        auto_blocks = pack_items(qty_map, ld_auto)
-        if auto_blocks:
-            avg_y_before = sum(b.yield_pct() for b in auto_blocks) / len(auto_blocks)
-            before_result = round(avg_y_before, 2)
-            call_erp_update_before_result("PAN", url_pono, before_result)
-            st.toast(f"✅ 구매의뢰 {url_pono} 자동 로드 | 사전수율 {before_result}% 전송 완료")
-        st.rerun()
 
 total_items = sum(input_slots.values())
 
