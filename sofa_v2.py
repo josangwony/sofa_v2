@@ -87,19 +87,39 @@ def _erp_post(endpoint, data_body):
         "identifier_id": ERP_IDENTIFIER,
         "data": data_body
     }
+    print(f"\n[ERP REQUEST] {now_kst().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"  URL     : POST {url}", flush=True)
+    print(f"  PAYLOAD : {json.dumps(payload, ensure_ascii=False)}", flush=True)
     try:
         resp = requests.post(url, json=payload, timeout=10)
-        resp.raise_for_status()
+        print(f"[ERP RESPONSE] status={resp.status_code}", flush=True)
+        print(f"  BODY    : {resp.text}", flush=True)
+        if not resp.ok:
+            try:
+                err_body = resp.json()
+                msg = err_body.get("_message", resp.text)
+                if isinstance(msg, list):
+                    msg = " | ".join(msg)
+            except Exception:
+                msg = resp.text
+            err = f"오류 ({resp.status_code}): {msg}"
+            print(f"  ERROR   : {err}", flush=True)
+            return None, err
         result = resp.json()
         if result.get("_code") == 200:
             return result.get("data", []), None
         else:
-            return None, f"API 오류 ({result.get('_code')}): {result.get('_message', '알 수 없는 오류')}"
-    except requests.exceptions.ConnectionError:
+            err = f"API 오류 ({result.get('_code')}): {result.get('_message', '알 수 없는 오류')}"
+            print(f"  ERROR   : {err}", flush=True)
+            return None, err
+    except requests.exceptions.ConnectionError as e:
+        print(f"[ERP ERROR] 연결 실패: {e}", flush=True)
         return None, "연결 실패: ERP 서버에 접근할 수 없습니다."
-    except requests.exceptions.Timeout:
+    except requests.exceptions.Timeout as e:
+        print(f"[ERP ERROR] 시간 초과: {e}", flush=True)
         return None, "시간 초과: 10초 이내에 응답이 없습니다."
     except Exception as e:
+        print(f"[ERP ERROR] {e}", flush=True)
         return None, f"오류: {str(e)}"
 
 def call_erp_query(storecd="PAN", pono=""):
@@ -110,13 +130,13 @@ def call_erp_update_poqty(storecd, pono, matcd, matcol, po_seq, poqty, after_res
     """구매의뢰수량 + 사후검사 결과 수정"""
     return _erp_post("/api/erp/v1/mat-po-dtl/update-poqty", {
         "storecd": storecd, "pono": pono, "matcd": matcd, "matcol": matcol,
-        "po_seq": po_seq, "poqty": poqty, "after_result": after_result
+        "poSeq": po_seq, "poqty": poqty, "afterResult": after_result
     })
 
 def call_erp_update_before_result(storecd, pono, before_result):
     """사전검사 결과 저장"""
     return _erp_post("/api/erp/v1/mat-po-hed/update-before-result", {
-        "storecd": storecd, "pono": pono, "before_result": before_result
+        "storecd": storecd, "pono": pono, "beforeResult": str(before_result)
     })
 
 def erp_data_to_dataframe(data):
