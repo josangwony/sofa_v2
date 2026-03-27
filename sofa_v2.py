@@ -145,7 +145,7 @@ def erp_data_to_dataframe(data):
         return pd.DataFrame()
     df = pd.DataFrame(data)
     col_map = {
-        'storecd': '사업장', 'pono': '구매의뢰번호', 'po_seq': '순번',
+        'storecd': '사업장', 'pono': '구매의뢰번호', 'poSeq': '순번',
         'matcd': '자재코드', 'matcol': '컬러', 'matname': '자재명',
         'poqty': '의뢰수량', 'sizedtl': '사이즈', 'width': '가로',
         'depth': '세로', 'height': '높이'
@@ -1214,7 +1214,7 @@ with st.expander("📡 ERP 구매의뢰 조회 → 수량 자동 반영", expand
         for row in erp_data:
             matcd  = row.get('matcd', '')
             matcol = row.get('matcol', 'XX')
-            po_seq = row.get('po_seq', 0)
+            po_seq = row.get('poSeq', 0)
             matname = row.get('matname') or (ITEM_MASTER[MATCODE_TO_ITEM[matcd]]['matname'] if matcd in MATCODE_TO_ITEM else matcd)
             label  = f"[순번{po_seq}] {matname} ({matcd})"
             row_options[label] = row
@@ -1248,12 +1248,12 @@ with st.expander("📡 ERP 구매의뢰 조회 → 수량 자동 반영", expand
                 _, err = call_erp_update_poqty(
                     erp_store_cur, erp_pono_cur,
                     sel_row.get('matcd',''), sel_row.get('matcol','XX'),
-                    sel_row.get('po_seq', 0), new_qty, _cur_yield)
+                    sel_row.get('poSeq', 0), new_qty, _cur_yield)
                 if err:
                     st.error(f"전송 실패: {err}")
                 else:
                     for r in st.session_state['_erp_data']:
-                        if r.get('po_seq') == sel_row.get('po_seq') and r.get('matcd') == sel_row.get('matcd'):
+                        if r.get('poSeq') == sel_row.get('poSeq') and r.get('matcd') == sel_row.get('matcd'):
                             r['poqty'] = new_qty
                             break
                     st.success(f"✅ 수량 수정 전송 완료 — {sel_row.get('matcd','')} {cur_qty} → {new_qty}개 | 수율 {_cur_yield}%")
@@ -1508,10 +1508,12 @@ if total_items > 0:
         errors = []
         debug_rows = []  # 전송 데이터 디버그용
 
+        # ERP 기존 데이터에 있는 자재 전송
+        sent_matcds = set()
         for row in erp_data:
             matcd  = str(row.get('matcd', ''))
             matcol = str(row.get('matcol', 'XX'))
-            po_seq = int(row.get('po_seq', 0))
+            po_seq = int(row.get('poSeq', 0))
 
             # 사이드바 최종 수량 우선, fallback은 원본 발주 수량
             item_code = MATCODE_TO_ITEM.get(matcd)
@@ -1520,15 +1522,42 @@ if total_items > 0:
             else:
                 poqty = int(row.get('poqty', 0))
 
+            sent_matcds.add(matcd)
             debug_rows.append({
                 'storecd': erp_storecd, 'pono': erp_pono,
                 'matcd': matcd, 'matcol': matcol,
-                'po_seq': po_seq, 'poqty': poqty,
+                'poSeq': po_seq, 'poqty': poqty,
                 'after_result': after_result
             })
 
             _, err = call_erp_update_poqty(
                 erp_storecd, erp_pono, matcd, matcol, po_seq, poqty, after_result)
+            if err:
+                errors.append(f"{matcd}: {err}")
+            else:
+                success_count += 1
+
+        # 시뮬레이션에만 있는 자재 추가 전송 (ERP 원본에 없던 항목)
+        for item_code, info in ITEM_MASTER.items():
+            if info['matcd'] in sent_matcds:
+                continue
+            if item_code not in input_slots:
+                continue
+            poqty = int(input_slots[item_code])
+            if poqty <= 0:
+                continue
+
+            matcd  = info['matcd']
+            matcol = info['matcol']
+            debug_rows.append({
+                'storecd': erp_storecd, 'pono': erp_pono,
+                'matcd': matcd, 'matcol': matcol,
+                'poSeq': 1, 'poqty': poqty,
+                'after_result': after_result
+            })
+
+            _, err = call_erp_update_poqty(
+                erp_storecd, erp_pono, matcd, matcol, 1, poqty, after_result)
             if err:
                 errors.append(f"{matcd}: {err}")
             else:
