@@ -965,10 +965,24 @@ if url_pono and st.session_state.get('_auto_pono') != url_pono:
 # 9. 사이드바
 # ============================================================
 with st.sidebar:
-    # 사이드바 버튼 폰트 축소 CSS
+    # 사이드바 버튼 폰트 축소 + 커스텀 툴팁 CSS
     st.markdown("""<style>
     section[data-testid="stSidebar"] button p { font-size: 0.72rem !important; }
     section[data-testid="stSidebar"] button { padding: 4px 6px !important; min-height: 0 !important; }
+    .matq { position:relative; display:inline-block; cursor:help;
+            font-size:0.65rem; color:#bbb; border:1px solid #ccc;
+            border-radius:50%; width:13px; height:13px; line-height:13px;
+            text-align:center; margin-left:4px; vertical-align:middle;
+            font-weight:600; }
+    .matq .matq-tip { display:none; position:absolute; bottom:calc(100% + 5px); left:50%;
+                      transform:translateX(-50%); background:#333; color:#fff;
+                      font-size:0.68rem; padding:4px 8px; border-radius:5px;
+                      white-space:nowrap; z-index:9999; line-height:1.5;
+                      pointer-events:none; }
+    .matq .matq-tip::after { content:''; position:absolute; top:100%; left:50%;
+                              transform:translateX(-50%); border:4px solid transparent;
+                              border-top-color:#333; }
+    .matq:hover .matq-tip { display:block; }
     </style>""", unsafe_allow_html=True)
 
     st.markdown("### ⚙️ 시스템 제어")
@@ -997,17 +1011,20 @@ with st.sidebar:
                 min_value=0, step=1, key=f"qty_{code}",
                 label_visibility="visible")
         with col_tag:
+            tip_html = (f"<span class='matq'>?"
+                        f"<span class='matq-tip'>{info['matcd']}<br>"
+                        f"{info['width']}×{info['depth']}×{info['height']}mm</span></span>")
             if is_mismatch:
                 blocks_needed = math.ceil(val / unit)
                 waste = blocks_needed * unit - val
                 st.markdown(
-                    f"<div style='padding-top:28px;font-size:0.72rem;color:#E67E22;line-height:1.3;'>"
-                    f"단위:{unit}개<br>⚠️+{waste}</div>",
+                    f"<div style='padding-top:22px;font-size:0.72rem;color:#E67E22;line-height:1.3;'>"
+                    f"단위:{unit}개<br>⚠️+{waste}{tip_html}</div>",
                     unsafe_allow_html=True)
             else:
                 st.markdown(
                     f"<div style='padding-top:28px;font-size:0.72rem;color:#9E9E9E;'>"
-                    f"단위:{unit}개</div>",
+                    f"단위:{unit}개{tip_html}</div>",
                     unsafe_allow_html=True)
 
     st.divider()
