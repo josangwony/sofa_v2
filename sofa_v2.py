@@ -1,9 +1,9 @@
 """
-소파 스펀지 재단 시뮬레이션 v3.0 — 통합 포탈 + ERP 연동
+스펀지 재단 시뮬레이션 v2 + ERP 연동
 """
 import streamlit as st
 import streamlit.components.v1 as components
-import json, os, copy, math, requests
+import json, os, copy, math, requests, uuid
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
@@ -17,7 +17,24 @@ def now_kst():
 # ============================================================
 # 1. 설정
 # ============================================================
-st.set_page_config(page_title="스펀지 재단 시뮬레이션", layout="wide", page_icon="iloom_LOGO.png")
+# set_page_config 전에 view 파라미터를 읽어 사이드바 초기 상태 결정
+# st.query_params는 set_page_config 이후에만 안전하므로
+# Streamlit 런타임 컨텍스트에서 직접 쿼리스트링을 파싱
+try:
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+    from urllib.parse import parse_qs
+    _ctx = get_script_run_ctx()
+    _qs  = parse_qs(_ctx.query_string) if (_ctx and _ctx.query_string) else {}
+    _init_view = _qs.get("view", ["admin"])[0]
+except Exception:
+    _init_view = "admin"
+
+st.set_page_config(
+    page_title="스펀지 재단 시뮬레이션",
+    layout="wide",
+    page_icon="iloom_LOGO.png",
+    initial_sidebar_state="collapsed" if _init_view == "floor" else "expanded",
+)
 
 BLOCK_W = 1212
 BLOCK_H = 1970
@@ -33,6 +50,10 @@ except OSError:
 STORAGE_FILE = os.path.join(STORAGE_DIR, "residual_blocks.json")
 PLAN_FILE = os.path.join(STORAGE_DIR, "current_plan.json")
 DEPLOY_LOG_FILE = os.path.join(STORAGE_DIR, "deploy_history.json")
+PLANS_DIR = os.path.join(STORAGE_DIR, "plans")
+try:
+    os.makedirs(PLANS_DIR, exist_ok=True)
+except: pass
 
 ITEM_MASTER = {
     'A': {'matname': '케렌시아 1인',         'matcd': 'OPFW005348-R000', 'matcol': 'XX', 'width': 550,  'depth': 480, 'height': 70,  'color': '#E74C3C'},
@@ -402,6 +423,57 @@ def _gs_write(tab_name, data):
         pass
     return False
 
+def save_plan_by_id(print_id, plan_dict):
+    """print_id별 계획 저장 (로컬 + Google Sheets plans 탭)"""
+    # 로컬 저장
+    try:
+        plan_path = os.path.join(PLANS_DIR, f"{print_id}.json")
+        with open(plan_path, 'w', encoding='utf-8') as f:
+            json.dump(plan_dict, f, ensure_ascii=False, indent=2)
+    except: pass
+    # Google Sheets: plans 탭에 행 추가
+    try:
+        wb = _get_gsheet()
+        if wb:
+            try:
+                ws = wb.worksheet('plans')
+            except Exception:
+                ws = wb.add_worksheet('plans', rows=1000, cols=2)
+                ws.update('A1:B1', [['print_id', 'plan_json']])
+            ws.append_rows([[print_id, json.dumps(plan_dict, ensure_ascii=False)]])
+    except: pass
+
+def load_plan_by_id(print_id):
+    """print_id로 특정 배포 계획 로드"""
+    if not print_id:
+        return None, []
+    # Google Sheets 우선
+    try:
+        wb = _get_gsheet()
+        if wb:
+            ws = wb.worksheet('plans')
+            rows = ws.get_all_values()
+            for row in rows[1:]:  # 헤더 skip
+                if row and row[0] == print_id and len(row) > 1:
+                    plan = json.loads(row[1])
+                    blocks = [Block.from_dict(d) for d in plan.get('blocks', [])]
+                    for b in blocks:
+                        b.is_saved = False
+                    return plan, blocks
+    except: pass
+    # 로컬 fallback
+    try:
+        plan_path = os.path.join(PLANS_DIR, f"{print_id}.json")
+        if os.path.exists(plan_path):
+            with open(plan_path, 'r', encoding='utf-8') as f:
+                plan = json.load(f)
+            blocks = [Block.from_dict(d) for d in plan.get('blocks', [])]
+            for b in blocks:
+                b.is_saved = False
+            return plan, blocks
+    except: pass
+    return None, []
+
 # ── 잔여 블록 ──
 def load_saved():
     # Google Sheets 우선
@@ -455,23 +527,28 @@ def remove_saved(bid):
 
 # ── 현장 배포 + 이력 ──
 def save_plan(blocks, input_slots):
-    """관리자가 확정한 재단 계획 저장 + 이력 기록"""
+    """관리자가 확정한 재단 계획 저장 + 이력 기록. print_id 반환."""
     now = now_kst().strftime('%Y-%m-%d %H:%M:%S')
+    print_id = uuid.uuid4().hex[:8]  # 8자리 고유 배포 ID
     avg_y = sum(b.yield_pct() for b in blocks) / len(blocks) if blocks else 0
     total_u = sum(input_slots.get(c,0) * ITEM_MASTER[c]['unit'] for c in ITEM_MASTER if input_slots.get(c,0)>0)
 
     plan = {
         'saved_at': now,
+        'print_id': print_id,
         'input_slots': {c: input_slots.get(c, 0) for c in ITEM_MASTER},
         'blocks': [b.to_dict() for b in blocks],
     }
-    # Google Sheets + 로컬
+    # Google Sheets + 로컬 (최신 계획)
     _gs_write('current_plan', plan)
     try:
         os.makedirs(STORAGE_DIR, exist_ok=True)
         with open(PLAN_FILE, 'w', encoding='utf-8') as f:
             json.dump(plan, f, ensure_ascii=False, indent=2)
     except: pass
+
+    # ID별 영구 저장 (현장 링크용)
+    save_plan_by_id(print_id, plan)
 
     # 배포 이력 — 블록별 기록
     block_logs = []
@@ -509,6 +586,8 @@ def save_plan(blocks, input_slots):
         with open(DEPLOY_LOG_FILE, 'w', encoding='utf-8') as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
     except: pass
+
+    return print_id
 
 def load_plan():
     """저장된 재단 계획 로드"""
@@ -916,7 +995,6 @@ with st.sidebar:
             input_slots[code] = st.number_input(
                 f"[{code}] {info['matname']}",
                 min_value=0, step=1, key=f"qty_{code}",
-                help=f"📦 {info['matcd']}\n📐 {info['width']}×{info['depth']}×{info['height']}mm",
                 label_visibility="visible")
         with col_tag:
             if is_mismatch:
@@ -1035,49 +1113,78 @@ if st.session_state.get('_view_log'):
 # ============================================================
 try:
     VIEW_MODE = st.query_params.get("view", "admin")
+    FLOOR_PID  = st.query_params.get("pid", "")
 except AttributeError:
     params = st.experimental_get_query_params()
     VIEW_MODE = params.get("view", ["admin"])[0]
+    FLOOR_PID  = params.get("pid", [""])[0]
 
 if VIEW_MODE == "floor":
     # ══════════════════════════════════════
     # 현장 전용 화면 (보기 전용)
     # ══════════════════════════════════════
-    # 사이드바 숨김
+    # 사이드바·상단툴바 완전 제거 + 메인 영역 여백 초기화
     st.markdown("""<style>
-        div[data-testid="stSidebar"] { display: none; }
-        .block-container { max-width: 100% !important; padding: 1rem 2rem !important; }
+        div[data-testid="stSidebar"],
+        div[data-testid="stSidebarNav"],
+        button[data-testid="collapsedControl"],
+        header[data-testid="stHeader"] { display: none !important; }
+        section[data-testid="stMain"] { margin-left: 0 !important; }
+        .block-container { max-width: 100% !important; padding: 1.5rem 1.5rem 1rem !important; }
         body, .stApp { background: #FAF8F6 !important; }
     </style>""", unsafe_allow_html=True)
 
-    plan, floor_blocks = load_plan()
+    if FLOOR_PID:
+        plan, floor_blocks = load_plan_by_id(FLOOR_PID)
+    else:
+        plan, floor_blocks = load_plan()
+
     if plan and floor_blocks:
+        avg_y_floor = sum(b.yield_pct() for b in floor_blocks) / len(floor_blocks)
+
+        # SVG 수집 (max-width 고정 → 높이 예측 가능)
+        SVG_MAX_W = 420  # px — 컬럼보다 작게 고정해 iframe 높이를 안정적으로 유지
+        floor_svgs = []
+        for bi, b in enumerate(floor_blocks):
+            svg, svg_h = make_svg(b, bi + 1)
+            # 340px → 420px 로 키우되 100%는 금지(iframe 높이 계산 필요)
+            svg = svg.replace('max-width:340px;', f'max-width:{SVG_MAX_W}px;')
+            floor_svgs.append((svg, svg_h))
+
+        # 헤더
         st.markdown(f"""
-        <div style="text-align:center; padding:8px 0;">
+        <div style="text-align:center; padding:8px 0 4px;">
             <div>
-                <span style="font-size:12px; font-weight:700; letter-spacing:2px; color:#7A736B;">FURSYS GROUP</span>
-                <span style="font-size:24px; font-weight:700; color:#dc2626; font-family:Georgia,serif; margin-left:8px;">iloom</span>
+                <span style="font-size:12px;font-weight:700;letter-spacing:2px;color:#7A736B;">FURSYS GROUP</span>
+                <span style="font-size:22px;font-weight:700;color:#dc2626;font-family:Georgia,serif;margin-left:8px;">iloom</span>
             </div>
-            <h1 style="margin:8px 0 0; color:#1A1816; font-size:1.8rem;">📐 재단 배치도</h1>
-            <p style="color:#A8A098; margin:4px 0; font-size:0.9rem;">배포 시각: {plan['saved_at']}
-            &nbsp;|&nbsp; 블록 {len(floor_blocks)}개
-            &nbsp;|&nbsp; 평균 수율 {sum(b.yield_pct() for b in floor_blocks)/len(floor_blocks):.1f}%</p>
+            <h1 style="margin:6px 0 0;color:#1A1816;font-size:1.6rem;">📐 재단 배치도</h1>
+            <p style="color:#A8A098;margin:4px 0;font-size:0.85rem;">
+                배포 시각: {plan['saved_at']}
+                &nbsp;|&nbsp; 블록 {len(floor_blocks)}개
+                &nbsp;|&nbsp; 평균 수율 {avg_y_floor:.1f}%
+            </p>
         </div>""", unsafe_allow_html=True)
 
-        # SVG를 크게 (max-width 제거)
-        for row in range(math.ceil(len(floor_blocks)/3)):
+        # SVG 그리드 — 3열
+        # vw = int(BLOCK_W*S)+PL+PR = int(1212*0.26)+50+15 = 380
+        # max-width:SVG_MAX_W 로 렌더될 때 실제 높이 = SVG_MAX_W * vh / vw
+        FLOOR_VW = int(BLOCK_W * 0.26) + 50 + 15   # 380
+        IFRAME_H_PAD = 50
+        for row in range(math.ceil(len(floor_svgs) / 3)):
             cols = st.columns(3)
             for ci in range(3):
-                bi = row*3+ci
-                if bi < len(floor_blocks):
+                bi = row * 3 + ci
+                if bi < len(floor_svgs):
+                    svg, svg_h = floor_svgs[bi]
+                    rendered_h = int(SVG_MAX_W * svg_h / FLOOR_VW)
                     with cols[ci]:
-                        svg, svg_h = make_svg(floor_blocks[bi], bi+1)
-                        svg = svg.replace('max-width:340px;', 'max-width:100%;')
                         components.html(
                             f'<div style="text-align:center;">{svg}</div>',
-                            height=int(svg_h*1.15)+30, scrolling=False)
+                            height=rendered_h + IFRAME_H_PAD,
+                            scrolling=False)
 
-        # 인쇄 버튼만
+        # 인쇄 버튼
         st.divider()
         pc1, pc2, pc3 = st.columns([4, 1, 4])
         with pc2:
@@ -1087,12 +1194,16 @@ if VIEW_MODE == "floor":
 
         fpts = st.session_state.pop('_fpts', None)
         if fpts:
-            all_svgs_f = [make_svg(floor_blocks[i], i+1)[0].replace('max-width:340px;','') for i in range(len(floor_blocks))]
+            print_svgs = []
+            for bi, b in enumerate(floor_blocks):
+                s, _ = make_svg(b, bi + 1)
+                s = s.replace('max-width:340px;', '')
+                print_svgs.append(s)
             svg_cells = ""
-            for i, s in enumerate(all_svgs_f):
-                safe = s.replace('\\','\\\\').replace('`','\\`').replace('${','\\${')
+            for i, s in enumerate(print_svgs):
+                safe = s.replace('\\', '\\\\').replace('`', '\\`').replace('${', '\\${')
                 svg_cells += f'<div class="cell">{safe}</div>'
-                if (i+1) % 3 == 0:
+                if (i + 1) % 3 == 0:
                     svg_cells += '<div style="clear:both;"></div>'
             components.html("""<script>
             var w=window.open('','_blank','width=1100,height=800');
@@ -1102,13 +1213,16 @@ if VIEW_MODE == "floor":
             .cell{width:33.33%;display:inline-block;vertical-align:top;padding:2mm;}
             svg{width:100%!important;max-width:none!important;height:auto!important;display:block;}
             @page{size:A4 landscape;margin:5mm;}</style></head><body>
-            <h2>소파 스펀지 재단 배치도</h2><div>""" + svg_cells.replace('`','\\`') + """</div>
+            <h2>소파 스펀지 재단 배치도</h2><div>""" + svg_cells.replace('`', '\\`') + """</div>
             </body></html>`);w.document.close();setTimeout(function(){w.print();},500);}
             </script><!-- """ + fpts + """ -->""", height=0)
 
         st.caption("v3.0 | 현장 전용 화면 (보기 전용)")
     else:
-        st.warning("⚠️ 배포된 재단 계획이 없습니다. 관리자가 먼저 '현장 배포' 버튼을 눌러야 합니다.")
+        if FLOOR_PID:
+            st.error(f"⚠️ 배포 ID '{FLOOR_PID}'에 해당하는 재단 계획을 찾을 수 없습니다.")
+        else:
+            st.warning("⚠️ 배포된 재단 계획이 없습니다. 관리자가 먼저 '현장 배포' 버튼을 눌러야 합니다.")
 
     st.stop()  # 현장 모드는 여기서 끝
 
@@ -1369,8 +1483,7 @@ if total_items > 0:
 
     # ── 추천 품목 (콤팩트 그리드) ──
     if recs:
-        st.markdown("##### 💡 빈 공간 추천 <small style='color:#AAA;font-weight:400'>(마우스 올리면 상세)</small>",
-                    unsafe_allow_html=True)
+        st.markdown("##### 💡 빈 공간 추천", unsafe_allow_html=True)
         NC = 5  # 고정 5칸
         # 헤더
         hcols = st.columns(NC)
@@ -1395,9 +1508,7 @@ if total_items > 0:
                                   use_container_width=True,
                                   on_click=_place_in_block,
                                   args=(recs[ci]['bidx'], rec['code'], rec['unit']),
-                                  help=f"[{rec['code']}] {rec['matname']}\n"
-                                       f"{rec['width']}×{rec['depth']}×{rec['height']}mm · {rec['unit']}개\n"
-                                       f"수율: {rec['cy']:.1f}% → {rec['ny']:.1f}%")
+                                  )
 
     st.divider()
 
@@ -1438,60 +1549,48 @@ if total_items > 0:
         all_svgs.append(svg_html)
         all_heights.append(svg_h)
 
-    # 현장 배포: 저장 + 전체화면 새 창
+    # 현장 배포: 저장 + 링크 생성
     deploy_ts = st.session_state.pop('_deploy_ts', None)
     if deploy_ts:
-        save_plan(blocks, input_slots)
-        avg_y_val = sum(b.yield_pct() for b in blocks) / len(blocks) if blocks else 0
-        svg_cells = ""
-        for i, s in enumerate(all_svgs):
-            safe = s.replace('\\','\\\\').replace('`','\\`').replace('${','\\${')
-            safe = safe.replace('max-width:340px;', '')
-            svg_cells += f'<div class="cell">{safe}</div>'
-            if (i+1) % 3 == 0:
-                svg_cells += '<div style="clear:both;"></div>'
+        _pid = save_plan(blocks, input_slots)
+        st.session_state['_last_print_id'] = _pid
+        st.toast("✅ 현장 배포 완료! 아래 링크를 현장에 공유하세요.")
+        st.rerun()
 
-        deploy_html = """
+    # ── 현장 배포 링크 표시 (배포 후 지속 표시) ──
+    last_pid = st.session_state.get('_last_print_id', '')
+    if last_pid:
+        deploy_link_html = f"""
+        <div style="background:#f0fdf4;border:1.5px solid #86efac;border-radius:10px;
+                    padding:14px 18px;margin:4px 0 8px;">
+            <div style="font-size:13px;color:#166534;font-weight:700;margin-bottom:8px;">
+                📡 현장 배포 링크 — 아래 링크를 현장에 공유하세요
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;">
+                <input id="fl_{last_pid}" type="text" readonly
+                    style="flex:1;padding:7px 10px;border:1px solid #d1d5db;border-radius:6px;
+                           font-size:12px;font-family:monospace;background:#fff;color:#1f2937;" value="">
+                <button onclick="var v=document.getElementById('fl_{last_pid}').value;
+                    navigator.clipboard.writeText(v);
+                    this.textContent='✅ 복사됨!';
+                    setTimeout(()=>this.textContent='📋 복사',1800);"
+                    style="padding:7px 14px;background:#16a34a;color:white;border:none;
+                           border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap;">📋 복사</button>
+                <button onclick="window.open(document.getElementById('fl_{last_pid}').value,'_blank');"
+                    style="padding:7px 14px;background:#2563eb;color:white;border:none;
+                           border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap;">🔗 열기</button>
+            </div>
+            <div style="font-size:11px;color:#6b7280;margin-top:6px;">배포 ID: {last_pid}</div>
+        </div>
         <script>
-        var w = window.open('', '_blank');
-        if(w){
-            w.document.write(`<!DOCTYPE html><html><head><title>재단 배치도 - 현장</title>
-            <style>
-                * { margin:0; padding:0; box-sizing:border-box; }
-                body { background:#FAF8F6; font-family:Malgun Gothic,NanumGothic,sans-serif; padding:20px 30px; }
-                .header { text-align:center; margin-bottom:16px; }
-                .header .brand { font-size:12px; font-weight:700; letter-spacing:2px; color:#7A736B; }
-                .header .iloom { font-size:22px; font-weight:700; color:#dc2626; font-family:Georgia,serif; margin-left:6px; }
-                .header h1 { font-size:24px; margin:8px 0 4px; color:#1A1816; }
-                .header .info { font-size:13px; color:#A8A098; }
-                .cell { width:33.33%; display:inline-block; vertical-align:top; padding:6px; }
-                svg { width:100%!important; max-width:none!important; height:auto!important; display:block; }
-                .toolbar { text-align:center; margin-top:12px; }
-                .toolbar button {
-                    padding:10px 32px; border:none; border-radius:8px; font-size:14px;
-                    font-weight:500; cursor:pointer; margin:0 6px;
-                    font-family:Malgun Gothic,sans-serif;
-                }
-                .btn-print { background:#dc2626; color:white; }
-                .btn-print:hover { background:#b91c1c; }
-                @page { size:A4 landscape; margin:5mm; }
-                @media print { .toolbar { display:none; } body { padding:5mm; } .cell { padding:1mm; } }
-            </style></head><body>
-            <div class="header">
-                <span class="brand">FURSYS GROUP</span><span class="iloom">iloom</span>
-                <h1>📐 재단 배치도</h1>
-                <p class="info">배포: """ + deploy_ts[:19].replace('T',' ') + """ | 블록 """ + str(len(blocks)) + """개 | 평균 수율 """ + f"{avg_y_val:.1f}" + """%</p>
-            </div>
-            <div>""" + svg_cells.replace('`','\\`') + """</div>
-            <div class="toolbar">
-                <button class="btn-print" onclick="window.print()">🖨️ 인쇄</button>
-            </div>
-            </body></html>`);
-            w.document.close();
-        } else { alert('팝업 차단됨 - 허용해 주세요.'); }
-        </script><!-- """ + deploy_ts + """ -->"""
-        components.html(deploy_html, height=0)
-        st.toast("✅ 현장 배포 완료! 새 창에서 배치도를 확인하세요.")
+        (function(){{
+            var base = window.location.origin + window.location.pathname;
+            var url = base + "?view=floor&pid={last_pid}";
+            document.getElementById("fl_{last_pid}").value = url;
+        }})();
+        </script>
+        """
+        components.html(deploy_link_html, height=110)
 
     # ERP 확정: 최종 확정 수량(poqty) + 시뮬레이션 수율(after_result) 함께 전송
     # poqty = 사이드바에서 최종 조정된 개수 (input_slots 기준)
