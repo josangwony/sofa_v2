@@ -96,7 +96,9 @@ try:
 except ImportError:
     pass
 
-ERP_BASE_URL = _get_secret("ERP_BASE_URL", "https://dev-erp-api2.fursys.com")
+APP_ENV = _get_secret("APP_ENV", "dev")  # "dev" (로컬/개발) 또는 "prod" (운영)
+_DEFAULT_ERP_URL = "https://erp-api2.fursys.com" if APP_ENV == "prod" else "https://dev-erp-api2.fursys.com"
+ERP_BASE_URL = _get_secret("ERP_BASE_URL", _DEFAULT_ERP_URL)
 ERP_AUTH_KEY = _get_secret("ERP_AUTH_KEY", "dc1c3d99-0700-4472-816e-e3f1e9111823")
 ERP_IDENTIFIER = _get_secret("ERP_IDENTIFIER", "external_partner")
 
